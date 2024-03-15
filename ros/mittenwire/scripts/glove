@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+
+import rospy
+import mittenwire.msg
+import numpy as np
+import mittenwire
+
+rospy.init_node("mittenwire_glove", disable_signals=False)
+
+pub_mat = rospy.Publisher("impedance_matrix_raw", mittenwire.msg.ImpedanceMatrix,
+                          latch=False, queue_size=100)
+
+pub_status = rospy.Publisher("glove_status", mittenwire.msg.GloveStatus,
+                             latch=False, queue_size=100)
+
+parser = mittenwire.GloveParser()
+
+
+def handle_packet(message):
+
+    ros_msg = parser.parse(message)
+
+    if isinstance(ros_msg,  mittenwire.msg.ImpedanceMatrix):
+        pub_mat.publish(ros_msg)
+
+    if isinstance(ros_msg,  mittenwire.msg.GloveStatus):
+        pub_status.publish(ros_msg)
+
+
+sub = rospy.Subscriber("/packets", mittenwire.msg.Packet,
+                       callback=handle_packet)
+
+rospy.spin()

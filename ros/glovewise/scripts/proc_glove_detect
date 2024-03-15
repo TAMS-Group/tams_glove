@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import mediapipe
+    import cv2
+    import numpy as np
+    import cv_bridge
+    import rospy
+    import glovewise
+    import rosbag
+    import mittenwire
+    import tractor as tr
+    import yaml
+    import threading
+    import pyglovewise
+    import pymittenwire
+
+
+viz = 1
+
+start_cutoff = 1.5
+
+
+class BagImage:
+    pass
+
+
+rospy.init_node("glovewise_proc_detect")
+
+
+for bagpath in sys.argv[1:]:
+
+    camera_count = 8
+
+    read_conditions = [threading.Condition() for i in range(camera_count)]
+    read_queues = [[] for i in range(camera_count)]
+    read_exit = False
+
+    write_lock = threading.Lock()
+    write_data = {}
+
+    if viz:
+        vizbag = rosbag.Bag(glovewise.extpath(bagpath, ".kviz.bag"), "w")
+        vizlock = threading.Lock()
+
+    def worker_thread_fun(camera_index):
+
+        global read_queues
+
+        read_condition = read_conditions[camera_index]
+
+        hand_detector = mediapipe.solutions.hands.Hands(
+            max_num_hands=1, static_image_mode=False,
+
+        )
+
+        bridge = cv_bridge.CvBridge()
+
+        print("worker thread started")
+
+        while True:
+
+            with read_condition:
+                while True:
+                    if len(read_queues[camera_index]) > 0:
+                        image = read_queues[camera_index][0]
+                        read_queues[camera_index] = read_queues[camera_index][1:]
+                        print("work received")
+                        break
+                    if read_exit:
+                        print("exiting worker thread")
+                        return
+                    read_condition.wait()
+
+            print("processing", (image.time.to_sec() - bag_start_time) *
+                  100 / (bag_end_time - bag_start_time), "%")
+
+            with glovewise.Profiler("process", 0):
+
+                img = bridge.compressed_imgmsg_to_cv2(image.image, "bgr8")
+
+                hue = -215
+                saturation = 100
+                brightness = 120
+
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2HSV_FULL)
+                h, s, v = cv2.split(img)
+
+                h += np.uint8(int(hue * 256 / 360))
+                s = cv2.multiply(s, (1, 1, 1, 1), scale=saturation * 0.01)
+
+                img = cv2.merge([h, s, v])
+                img = cv2.cvtColor(img, cv2.COLOR_HSV2RGB_FULL)
+
+                img = cv2.multiply(img, (1, 1, 1, 1),
+                                   scale=brightness * 0.01)
+
+                img2 = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+                if viz:
+                    rendering = np.array(img)
+
+                for rot in [0]:
+
+                    with glovewise.Profiler("handnet", 0):
+                        results = hand_detector.process(img2)
+
+                    if results.multi_hand_landmarks:
+
+                        ok = results.multi_hand_landmarks and len(
+                            results.multi_handedness) == 1 and results.multi_handedness[0].classification[0].label == "Left"
+
+                        if ok:
+
+                            if viz:
+
+                                print(rendering.shape)
+                                mediapipe.solutions.drawing_utils.draw_landmarks(
+                                    rendering,
+                                    results.multi_hand_landmarks[0],
+                                    mediapipe.solutions.hands.HAND_CONNECTIONS,
+                                    mediapipe.solutions.drawing_styles.get_default_hand_landmarks_style(),
+                                    mediapipe.solutions.drawing_styles.get_default_hand_connections_style())
+
+                            t = image.image.header.stamp.to_sec()
+                            with write_lock:
+                                landmarks = results.multi_hand_landmarks[0]
+                                for index, landmark in enumerate(landmarks.landmark):
+                                    x = int(round(landmark.x * image.info.roi.width +
+                                            image.info.roi.x_offset - 16))
+                                    y = int(round(landmark.y * image.info.roi.height +
+                                            image.info.roi.y_offset - 54))
+                                    if index not in write_data[t]["hand"]["keypoints"]:
+                                        write_data[t]["hand"]["keypoints"][index] = {
+                                        }
+                                    write_data[t]["hand"]["keypoints"][index][image.name] = [
+                                        x, y]
+
+                    rendering = np.rot90(rendering).copy()
+                    img2 = np.rot90(img2).copy()
+
+                with vizlock:
+                    vizbag.write(
+                        image.name, bridge.cv2_to_compressed_imgmsg(rendering), image.image.header.stamp)
+
+            t = image.image.header.stamp.to_sec()
+            with write_lock:
+                info = image.info
+                write_data[t]["views"][image.name] = {
+                    "roi": {
+                        "left": info.roi.x_offset,
+                        "top": info.roi.y_offset,
+                        "width": info.roi.width,
+                        "height": info.roi.height,
+                    },
+                    "sensor": {
+                        "width": info.width,
+                        "height": info.height,
+                    },
+                }
+
+    threads = [threading.Thread(target=lambda i=i: worker_thread_fun(i))
+               for i in range(camera_count)]
+    for t in threads:
+        t.start()
+
+    outpath = glovewise.extpath(bagpath, ".detect.yaml")
+
+    with rosbag.Bag(bagpath, "r") as bag:
+
+        print(bag)
+
+        last_time = rospy.Time(0)
+
+        image_messages = {}
+        camera_info_messages = {}
+
+        bag_start_time = bag.get_start_time()
+        bag_end_time = bag.get_end_time()
+
+        for topic, message, mtime in bag:
+
+            if rospy.is_shutdown():
+                print("shutting down")
+                break
+
+            if mtime != last_time:
+                last_time = mtime
+
+                with write_lock:
+                    t = mtime.to_sec()
+                    write_data[t] = {
+                        "time": t,
+                        "hand": {
+                            "keypoints": {},
+                        },
+                        "views": {},
+                    }
+
+                bag_images = {}
+                for name in (image_messages.keys() & camera_info_messages.keys()):
+                    image_time, image_message = image_messages[name]
+                    info_time, info_message = camera_info_messages[name]
+                    if image_time == info_time and image_time.to_sec() - bag_start_time > start_cutoff and info_message.roi.width < info_message.width:
+                        b = BagImage()
+                        b.time = last_time
+                        b.name = name
+                        b.image = image_message
+                        b.info = info_message
+                        bag_images[name] = b
+                if len(bag_images) > 0:
+                    for camera_index in range(camera_count):
+                        camera_name = "/cam"+str(camera_index)
+                        if camera_name in bag_images:
+                            print("push image")
+                            with read_conditions[camera_index]:
+                                read_queues[camera_index].append(
+                                    bag_images[camera_name])
+                                read_conditions[camera_index].notify()
+
+                image_messages = {}
+                camera_info_messages = {}
+
+            if topic.endswith("/image_raw/compressed"):
+                image_messages[topic[:-
+                                     len("/image_raw/compressed")]] = (mtime, message)
+
+            if topic.endswith("/camera_info"):
+                camera_info_messages[topic[:-
+                                           len("/camera_info")]] = (mtime, message)
+
+    for i in range(camera_count):
+        with read_conditions[i]:
+            read_exit = True
+            read_conditions[i].notify_all()
+
+    for t in threads:
+        t.join()
+
+    if viz:
+        with vizlock:
+            vizbag.close()
+
+    print("sorting")
+    write_data = write_data.items()
+    write_data = sorted(write_data, key=lambda x: x[0])
+    write_data = [d[1] for d in write_data]
+
+    print("writing")
+    with open(outpath, "w") as outfile:
+        yaml.dump({
+            "detections": write_data,
+        }, outfile)

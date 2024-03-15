@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+
+import rospy
+import mittenwire.msg
+import cstruct
+import struct
+import numpy as np
+import cv2
+import time
+
+layout = """
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- -- a2 b2 c2 -- d2 e2 f2 -- a7 b7 c7 -- d7 e7 f7 -- -- --
+-- -- a3 b3 c3 -- d4 e4 f4 -- a8 b8 c8 -- d8 e8 f8 -- -- --
+-- -- a4 b4 c4 -- d3 e3 f3 -- a9 b9 c9 -- d9 e9 f9 -- -- --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- -- b0 b1 c1 -- e0 e1 f1 -- b5 b6 c6 -- e5 e6 f6 -- -- --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- -- a1 a0 c0 -- d1 d0 f0 -- a6 a5 c5 -- d6 d5 f5 -- -- --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- 0c 0b 0a 0f -- -- -- -- 72 82 92 -- -- --
+-- -- -- -- -- -- 1c 1b 1a 1f -- -- -- -- 71 81 91 -- -- --
+-- -- -- -- -- -- 2c 2b 2a 2f -- -- -- -- 70 80 90 -- -- --
+-- -- -- -- -- -- 3c 3b 3a 3f 3e 3d -- -- -- -- -- -- -- --
+-- -- -- -- -- -- 4c 4b 4a 4f 4e 4d -- -- 84 83 93 -- -- --
+-- -- -- -- -- -- 5c 5b 5a 5f 5e 5d -- -- -- -- -- -- -- --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+"""
+
+
+layout = layout.strip()
+layout = layout.split("\n")
+layout = [row.split() for row in layout]
+layout = [[([int(c, 16) for c in cell] if cell != "--" else False)
+           for cell in row] for row in layout]
+print(layout)
+
+rospy.init_node("mittenwire_gloveview", disable_signals=False)
+
+data = False
+initialized = False
+image = False
+
+
+def handle_packet(message):
+    global data
+    d = np.sqrt(np.square(message.inphase) + np.square(message.quadrature))
+    d = d.reshape([message.height, message.width])
+    d = [[(d[cell[1], cell[0]] if cell is not False else -999999999999)
+          for cell in row] for row in layout]
+    data = d
+
+
+sub = rospy.Subscriber(
+    "impedance_matrix_f", mittenwire.msg.ImpedanceMatrix, callback=handle_packet)
+
+scaling = 0.0
+ref = False
+
+cv2.startWindowThread()
+
+cv2.namedWindow("Tactile", cv2.WINDOW_NORMAL)
+
+while not rospy.is_shutdown():
+    if data is False:
+        time.sleep(0.01)
+        continue
+
+    image = np.array(data)
+
+    mask = (image < 0).astype(np.uint8)
+
+    if ref is not False:
+
+        image = image - ref
+
+    image = image * scaling + 0.2
+    s = 20
+    image = cv2.resize(image, (0, 0), fx=s, fy=s,
+                       interpolation=cv2.INTER_NEAREST)
+    mask = cv2.resize(mask, (0, 0), fx=s, fy=s,
+                      interpolation=cv2.INTER_NEAREST)
+    image = cv2.applyColorMap(np.maximum(
+        image * 0.0, np.minimum(image * 0.0 + 255, image * 255)).astype(np.uint8), cv2.COLORMAP_JET)
+    image[mask != 0] = [0, 0, 0]
+
+    cv2.imshow("Tactile", image)
+
+    if not initialized:
+        initialized = True
+        cv2.createTrackbar("Range", "Tactile", 0, 2000, lambda x: x)
+    scaling = (1 + cv2.getTrackbarPos("Range", "Tactile"))
+    scaling = 1e-9 * scaling * scaling
+
+    key = cv2.waitKey(30)
+    if key > 0:
+        print(key)
+    if key == 113 or key == 27:
+        print("exiting")
+        break
+    if key == ord("s"):
+        name = "gloveview-" + str(time.time_ns()) + ".png"
+        print("save", name)
+        cv2.imwrite(name, image)
+    if key == 32:
+        ref = np.array(data)

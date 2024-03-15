@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+print("load libraries")
+if 1:
+    import glovewise
+    import numpy as np
+    import tractor as tr
+    import tractor.types_double as tt
+    import copy
+    import glovewise.glovefusion
+
+tr.profiler.start()
+tr.init_ros("glovewise_proc_solve", False)
+
+print("load multicam")
+multicam_test = glovewise.MultiCameraModel.load(sys.argv[1])
+
+multicam_solve = copy.copy(multicam_test)
+
+print("load glove model")
+glove_model = glovewise.GloveModel()
+glove_model.load_resource("glovewise", "/models/bonehand37s.dae")
+
+glove_fusion = glovewise.glovefusion.GloveFusion(glove_model)
+
+for bag_path in sys.argv[2:]:
+    glove_fusion.load_data(bag_path)
+    glove_fusion.solve_trajectory(
+        multicam_solve, multicam_test, False)
+    print("test_errors", glove_fusion.test_errors)
+    glove_fusion.export_trajectory()

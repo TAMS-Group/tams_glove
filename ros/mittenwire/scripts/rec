@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+
+import mittenwire
+import rospy
+import rosbag
+import sdl2
+import sys
+import time
+import sensor_msgs.msg
+import threading
+import numpy as np
+
+rospy.init_node("mittenwire", disable_signals=True)
+
+app = mittenwire.RecordingApp()
+app.run()
+
+rospy.signal_shutdown("")
+
+print("exit")

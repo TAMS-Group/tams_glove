@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+
+import cv2
+
+# cv2.aruco.ArucoBoard()
+
+print(cv2.aruco.__dict__.keys())
+
+board = cv2.aruco.CharucoBoard_create(5, 7, 0.04, 0.02, cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250))
+
+img = board.draw(outSize=(210*20, 297*20))
+
+cv2.imshow("X", img)
+cv2.waitKey(0)
+
+cv2.imwrite("charuco.png", img)

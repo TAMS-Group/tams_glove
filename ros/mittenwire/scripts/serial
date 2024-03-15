@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+
+import serial
+import sys
+import numpy as np
+import mittenwire.msg
+import base64
+import rospy
+import binascii
+
+rospy.init_node("tamsnet_serial", disable_signals=True)
+print("tams_serial node started")
+
+ser = serial.Serial(sys.argv[1], 2000000,
+                    xonxoff=False, rtscts=False, dsrdtr=False)
+print("serial port opened")
+
+pub = rospy.Publisher("packets", mittenwire.msg.Packet,
+                      latch=False, queue_size=100)
+print("publisher created")
+
+first = True
+
+while True:
+    try:
+        packet = mittenwire.msg.Packet()
+        packet.data = base64.decodebytes(ser.readline())
+        pub.publish(packet)
+        # print(type(packet.data))
+        if first:
+            print("receiving packets")
+            first = False
+    except binascii.Error as err:
+        print(err)

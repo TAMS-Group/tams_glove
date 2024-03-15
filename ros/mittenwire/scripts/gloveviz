@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+
+import rospy
+import mittenwire.msg
+import numpy as np
+import cv2
+import rospkg
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
+import time
+import sensor_msgs
+import cv_bridge
+
+layout = """
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- a2 b2 c2 -- d2 e2 f2 -- a7 b7 c7 -- d7 e7 f7 -- -- -- -- --
+-- a3 b3 c3 -- d4 e4 f4 -- a8 b8 c8 -- d8 e8 f8 -- -- -- -- --
+-- a4 b4 c4 -- d3 e3 f3 -- a9 b9 c9 -- d9 e9 f9 -- 72 82 92 --
+-- b0 b1 c1 -- e0 e1 f1 -- b5 b6 c6 -- e5 e6 f6 -- 71 81 91 --
+-- a1 a0 c0 -- d1 d0 f0 -- a6 a5 c5 -- d6 d5 f5 -- 70 80 90 --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- 84 83 93 --
+-- -- -- -- -- -- 0c 0b 0a 0f -- -- -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- 1c 1b 1a 1f -- -- -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- 2c 2b 2a 2f -- -- -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- 3c 3b 3a 3f 3e 3d -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- 4c 4b 4a 4f 4e 4d -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- 5c 5b 5a 5f 5e 5d -- -- -- -- -- -- -- -- --
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+"""
+
+layout = {
+
+    "VTH0": [
+        "72 82 92",
+        "71 81 91",
+        "70 80 90",
+    ],
+    "VTH1": [
+        "84 83 93",
+    ],
+
+    "VFF0": [
+        "d7 e7 f7",
+        "d8 e8 f8",
+        "d9 e9 f9",
+    ],
+    "VFF1": [
+        "e5 e6 f6",
+    ],
+    "VFF2": [
+        "d6 d5 f5",
+    ],
+
+    "VMF0": [
+        "a7 b7 c7",
+        "a8 b8 c8",
+        "a9 b9 c9",
+    ],
+    "VMF1": [
+        "b5 b6 c6",
+    ],
+    "VMF2": [
+        "a6 a5 c5",
+    ],
+
+    "VRF0": [
+        "d2 e2 f2",
+        "d4 e4 f4",
+        "d3 e3 f3",
+    ],
+    "VRF1": [
+        "e0 e1 f1",
+    ],
+    "VRF2": [
+        "d1 d0 f0",
+    ],
+
+    "VLF0": [
+        "a2 b2 c2",
+        "a3 b3 c3",
+        "a4 b4 c4",
+    ],
+    "VLF1": [
+        "b0 b1 c1",
+    ],
+    "VLF2": [
+        "a1 a0 c0",
+    ],
+
+    "VPalm": [
+        "0c 0b 0a 0f -- --",
+        "1c 1b 1a 1f -- --",
+        "2c 2b 2a 2f -- --",
+        "3c 3b 3a 3f 3e 3d",
+        "4c 4b 4a 4f 4e 4d",
+        "5c 5b 5a 5f 5e 5d",
+    ],
+}
+
+gains = {
+    "VPalm": 0.5
+}
+
+for name in layout:
+    layout[name] = [row.split() for row in layout[name]]
+    layout[name] = [[([int(c, 16) for c in cell] if cell != "--" else False)
+                     for cell in row] for row in layout[name]]
+
+print(layout)
+
+rospy.init_node("mittenwire_gloveviz", disable_signals=False)
+
+redraw = True
+
+
+def trigger_redraw():
+    global redraw
+    redraw = True
+
+
+data = False
+
+
+def handle_packet(message):
+    global data
+    d = np.sqrt(np.square(message.inphase) + np.square(message.quadrature))
+    d = d.reshape([message.height, message.width])
+    data = d
+    trigger_redraw()
+
+
+sub = rospy.Subscriber(
+    "impedance_matrix", mittenwire.msg.ImpedanceMatrix, callback=handle_packet)
+
+bridge = cv_bridge.CvBridge()
+pub = rospy.Publisher("/gloveviz", sensor_msgs.msg.Image,
+                      queue_size=1, tcp_nodelay=True)
+
+pkg = rospkg.RosPack()
+modelpath = pkg.get_path("mittenwire") + "/data/gloveviz.obj"
+print(modelpath)
+
+part_names = []
+part_triangles = []
+all_triangles = []
+part_vertices = []
+all_vertices = []
+all_texcoords = []
+part_texcoord_indices = []
+with open(modelpath) as file:
+    for line in file:
+        tokens = line.split()
+        if tokens[0] == "o":
+            part_names.append(tokens[1])
+            part_vertices.append([])
+            part_triangles.append([])
+            part_texcoord_indices.append([])
+        if tokens[0] == "v":
+            v = (
+                float(tokens[1]),
+                float(tokens[2]),
+                float(tokens[3]),
+            )
+            all_vertices.append(v)
+            part_vertices[-1].append(v)
+        if tokens[0] == "vt":
+            t = (
+                float(tokens[1]),
+                float(tokens[2]),
+            )
+            all_texcoords.append(t)
+        if tokens[0] == "f":
+            indices = [[int(i) - 1 for i in v.split("/")] for v in tokens[1:]]
+            for i in range(2, len(indices)):
+                t = (
+                    indices[0][0],
+                    indices[i - 1][0],
+                    indices[i - 0][0],
+                )
+                part_triangles[-1].append(t)
+                all_triangles.append(t)
+                part_texcoord_indices[-1].append((
+                    indices[0][1],
+                    indices[i - 1][1],
+                    indices[i - 0][1],
+                ))
+all_vertices = np.array(all_vertices, dtype=np.float32)
+all_texcoords = np.array(all_texcoords, dtype=np.float32)
+part_vertices = [np.array(a, dtype=np.float32) for a in part_vertices]
+part_texcoord_indices = [np.array(a, dtype=np.uint32)
+                         for a in part_texcoord_indices]
+print(all_vertices)
+
+triangulation = tri.Triangulation(
+    x=all_vertices[:, 0], y=all_vertices[:, 1], triangles=all_triangles)
+
+
+colormap = plt.cm.jet
+
+
+part_mapping_table = []
+for ipart in range(len(part_names)):
+    part_mapping_list = []
+    for itri in range(len(part_triangles[ipart])):
+        for iedge in range(3):
+            coord = part_texcoord_indices[ipart][itri][iedge]
+            texcoord = all_texcoords[coord]
+            texcoord = np.array(texcoord)
+            texcoord[1] = 1 - texcoord[1]
+            part_mapping_list.append([
+                part_triangles[ipart][itri][iedge],
+                texcoord[1],
+                texcoord[0],
+            ])
+    part_mapping_map = {m[0]: [m[1], m[2]] for m in part_mapping_list}
+    part_mapping_list = [[p[0], p[1][0], p[1][1]]
+                         for p in part_mapping_map.items()]
+    part_mapping_list = sorted(part_mapping_list, key=lambda m: m[0])
+    part_mapping_table.append([
+        np.array([m[0] for m in part_mapping_list], dtype=np.uint32),
+        np.array([m[1] for m in part_mapping_list], dtype=np.float32),
+        np.array([m[2] for m in part_mapping_list], dtype=np.float32),
+    ])
+
+
+scaling = 0
+
+initialized = False
+ref = np.zeros([16, 16], dtype=np.float32)
+data_prev = False
+img = False
+while not rospy.is_shutdown():
+
+    if img is not False:
+
+        if 0:
+            s = 0.5
+            imgv = cv2.resize(img, (0, 0), fx=s, fy=s,
+                              interpolation=cv2.INTER_AREA)
+            cv2.imshow("Glove", imgv)
+
+        if 1:
+            cv2.imshow("Glove", img)
+
+        if not initialized:
+            initialized = True
+            cv2.createTrackbar("Range", "Glove", 0, 2000,
+                               lambda x: trigger_redraw())
+        scaling = (1 + cv2.getTrackbarPos("Range", "Glove"))
+        scaling = 1e-9 * scaling * scaling
+
+        k = cv2.waitKey(100)
+        if k > 0:
+            print("key", k)
+        if k == 113 or k == 27:
+            break
+        if k == 32:
+            d = data
+            if d is not False:
+                d = np.array(d)
+                ref[d != 0] = d[d != 0]
+                trigger_redraw()
+        if k == 122 or k == 114:
+            ref *= 0
+
+    else:
+        print("no data received")
+        time.sleep(0.1)
+
+    if data is False or not redraw:
+        continue
+    data_prev = data
+    redraw = False
+
+    print("draw")
+
+    fig = plt.Figure(figsize=(5, 5), dpi=100)
+
+    dat = np.array(data)
+
+    dat = dat - ref
+
+    if True:
+        vertex_pressures = np.zeros(len(all_vertices))
+
+        print("prepare")
+        t = time.time()
+
+        for ipart in range(len(part_names)):
+            name = part_names[ipart]
+            if name not in layout:
+                continue
+            patch = [[(dat[cell[1], cell[0]] if cell is not False else 0)
+                      for cell in row] for row in layout[name]]
+            patch = np.array(patch, np.float32)
+            if 1:
+                mask = [[(0 if cell is not False else 255)
+                        for cell in row] for row in layout[name]]
+                mask = np.array(mask, dtype=np.uint8)
+                patch = cv2.inpaint(patch, mask, 1, cv2.INPAINT_NS)
+            if name in gains:
+                patch *= gains[name]
+            s = 50
+            patch = cv2.resize(patch, (0, 0), fx=s, fy=s,
+                               interpolation=cv2.INTER_CUBIC)
+            patch = patch * scaling
+
+            if 0:
+                for itri in range(len(part_triangles[ipart])):
+                    for iedge in range(3):
+                        coord = part_texcoord_indices[ipart][itri][iedge]
+                        texcoord = all_texcoords[coord]
+                        texcoord = np.array(texcoord)
+                        texcoord[1] = 1 - texcoord[1]
+                        value = patch[
+                            int(round(texcoord[1] * (patch.shape[0] - 1))),
+                            int(round(texcoord[0] * (patch.shape[1] - 1)))
+                        ]
+                        vertex_pressures[part_triangles[ipart]
+                                         [itri][iedge]] = value
+
+            if 0:
+                itri = np.array(
+                    range(len(part_triangles[ipart])), dtype=np.uint32)
+                coord = part_texcoord_indices[ipart][itri, :]
+                print(coord.shape)
+                texcoord = all_texcoords[coord]
+                texcoord = np.array(texcoord)
+                texcoord[1] = 1 - texcoord[1]
+
+            if 0:
+                ll = part_mapping_table[ipart]
+                for i in range(len(ll[0])):
+                    value = patch[
+                        int(round(ll[1][i] * (patch.shape[0] - 1))),
+                        int(round(ll[2][i] * (patch.shape[1] - 1)))
+                    ]
+                    vertex_pressures[ll[0][i]] = value
+
+            if 1:
+                ll = part_mapping_table[ipart]
+                yy = np.round(ll[1] * (patch.shape[0] - 1)).astype(np.uint32)
+                xx = np.round(ll[2] * (patch.shape[1] - 1)).astype(np.uint32)
+                vv = patch[yy, xx]
+                vertex_pressures[ll[0]] = vv
+
+        print(time.time() - t)
+
+        print("tonemap")
+        t = time.time()
+        vertex_pressures[vertex_pressures < 0] = 0
+        vertex_pressures = 1 - np.power(0.5, vertex_pressures)
+
+        vertex_pressures = np.square(vertex_pressures)
+        print(time.time() - t)
+
+        print("tripcolor")
+        t = time.time()
+        fig.gca().tripcolor(
+            triangulation,
+            vertex_pressures,
+            cmap=colormap,
+            shading="gouraud",
+            vmin=-0.05,
+            vmax=1.0
+        )
+        print(time.time() - t)
+
+        print("d")
+
+    print("draw")
+    t = time.time()
+
+    fig.gca().axis("off")
+    fig.gca().set_aspect("equal", adjustable="box")
+    fig.gca().margins(0.01)
+    fig.tight_layout(pad=0)
+
+    fig.canvas.draw()
+    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img = img[:, :, ::-1]
+
+    print(time.time() - t)
+
+    print("finished drawing")
+
+    pub.publish(bridge.cv2_to_imgmsg(img, encoding="bgr8"))

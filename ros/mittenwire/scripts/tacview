@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+
+import rospy
+import mittenwire.msg
+import cstruct
+import struct
+import numpy as np
+import cv2
+
+rospy.init_node("mittenwire_tacview", disable_signals=False)
+
+
+data = False
+initialized = False
+image = False
+
+
+def handle_packet(message):
+    global data
+
+    d = np.zeros([message.height, message.width, 2])
+    d[:, :, 0] = np.reshape(message.inphase, [message.height, message.width])
+    d[:, :, 1] = np.reshape(message.quadrature, [
+                            message.height, message.width])
+    data = d
+
+
+sub = rospy.Subscriber(
+    "impedance_matrix_f", mittenwire.msg.ImpedanceMatrix, callback=handle_packet)
+
+scaling = 0.0
+ref = False
+
+cv2.startWindowThread()
+
+
+def filter(image, offset, ref=False):
+    if ref is not False:
+        image = image - ref
+
+    image = image * scaling + offset
+    s = 50
+    image = cv2.resize(image, (0, 0), fx=s, fy=s,
+                       interpolation=cv2.INTER_NEAREST)
+    image = cv2.applyColorMap(np.maximum(
+        image * 0.0, np.minimum(image * 0.0 + 255, image * 255)).astype(np.uint8), cv2.COLORMAP_JET)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fontsize = 0.5
+    thickness = 2
+    for y in range(data.shape[0]):
+        for x in range(data.shape[1]):
+            txt = hex(256+x*16+y)[3:]
+            tsz = cv2.getTextSize(txt, font, fontsize, thickness)[0]
+            image = cv2.putText(image, txt, (
+                round((x+0.5)*s-tsz[0]/2),
+                round((y+0.5)*s+tsz[1]/2)), font, fontsize, (255, 255, 255), thickness)
+
+    return image
+
+
+while not rospy.is_shutdown():
+    if data is False:
+        continue
+
+    image = np.array(data)
+
+    m = np.sqrt(np.square(image[:, :, 0]) + np.square(image[:, :, 1]))
+
+    cv2.imshow("Inphase", filter(image[:, :, 0], 0.5))
+    cv2.imshow("Quadrature", filter(image[:, :, 1], 0.5))
+
+    cv2.imshow("Tactile", filter(m, 0.2, ref))
+
+    if not initialized:
+        initialized = True
+        cv2.createTrackbar("Range", "Tactile", 0, 10000, lambda x: x)
+    scaling = 1e-8 * (1 + cv2.getTrackbarPos("Range", "Tactile"))
+
+    key = cv2.waitKey(30)
+    if key > 0:
+        print(key)
+
+    if key == 113 or key == 27:
+        print("exiting")
+        break
+
+    if key == 32:
+        ref = np.array(m)

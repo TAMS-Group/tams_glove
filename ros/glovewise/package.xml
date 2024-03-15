@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<package>
+  <name>glovewise</name>
+  <version>0.0.0</version>
+  <description>-</description>
+
+  <maintainer email="ruppel@informatik.uni-hamburg.de">Philipp Ruppel</maintainer>
+  <author email="ruppel@informatik.uni-hamburg.de">Philipp Ruppel</author>
+  
+  <license>-</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>roscpp</build_depend>
+  <run_depend>roscpp</run_depend>
+
+  <build_depend>rospy</build_depend>
+  <run_depend>rospy</run_depend>
+
+  <build_depend>std_msgs</build_depend>
+  <run_depend>std_msgs</run_depend>
+
+  <build_depend>geometry_msgs</build_depend>
+  <run_depend>geometry_msgs</run_depend>
+
+  <build_depend>pybind11_catkin</build_depend>
+  <run_depend>pybind11_catkin</run_depend>
+
+  <build_depend>message_generation</build_depend>
+  <run_depend>message_generation</run_depend>
+
+  <build_depend>message_runtime</build_depend>
+  <run_depend>message_runtime</run_depend>
+
+  <build_depend>cv_bridge</build_depend>
+  <run_depend>cv_bridge</run_depend>
+
+  <build_depend>image_transport</build_depend>
+  <run_depend>image_transport</run_depend>
+
+  <build_depend>mittenwire</build_depend>
+  <run_depend>mittenwire</run_depend>
+
+  <build_depend>eigen_conversions</build_depend>
+  <run_depend>eigen_conversions</run_depend>
+
+  <build_depend>eigen</build_depend>
+  <run_depend>eigen</run_depend>
+
+  <export>
+  </export>
+
+</package>

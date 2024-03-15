@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+
+import tams_superspeed_python
+import time
+
+context = tams_superspeed_python.Context()
+dev = tams_superspeed_python.Device()
+dev.open_vid_pid(context, 0x0403, 0x601f)
+
+dev.set_gpio_direction(1, 1)
+while True:
+    dev.set_gpio_level(1, 1)
+    time.sleep(0.01)
+    dev.set_gpio_level(1, 0)
+    time.sleep(0.02)

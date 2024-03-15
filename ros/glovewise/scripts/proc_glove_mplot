@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+print("load libraries")
+if 1:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import sys
+    import math
+
+data = np.genfromtxt(sys.argv[1], dtype=None)
+print(data)
+
+for row in data:
+    color = "green" if row[0] else "red"
+    dat = np.array(row.tolist()[5:])
+    print(dat)
+    plt.plot(np.arange(len(dat))+2 +
+             math.log10(row[4]) * (len(dat) + 1), np.log10(dat), c=color, alpha=0.5)
+
+
+plt.show()

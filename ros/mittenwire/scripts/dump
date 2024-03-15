@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+
+import mittenwire
+import time
+import numpy as np
+import cv2
+import rospy
+
+rospy.init_node("mittenwire_dump")
+
+port_count = 8
+
+sensor_configs = {}
+hub_config = False
+
+ctx = mittenwire.Context()
+
+dev = mittenwire.Device()
+dev.open_vid_pid(ctx, 0x0403, 0x601f)
+dev.reset()
+
+print("power on")
+dev.set_gpio_direction(1, 1)
+dev.set_gpio_level(1, 1)
+
+print("start")
+dev.start()
+
+net = mittenwire.Master(dev)
+
+hub = mittenwire.Hub(net)
+
+wr = mittenwire.Writer(dev)
+
+
+def packet_callback(packet):
+    print("packet")
+    if 1:
+        print(packet.channel, len(packet.data), packet.str)
+
+
+nodes = []
+for iport in range(port_count):
+    node = mittenwire.Node(packet_callback)
+    nodes.append(node)
+    hub.connect(iport, node)
+
+print("create event loop")
+evl = mittenwire.EventLoop(ctx, [dev])
+
+rospy.spin()
+
+print("exit")

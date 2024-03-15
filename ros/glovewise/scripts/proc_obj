@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import cv2
+    import numpy as np
+    import cv_bridge
+    import rospy
+    import glovewise
+    import rosbag
+    import mittenwire
+    import tractor as tr
+    import yaml
+    import threading
+    import tractor.types_double as tt
+    import sklearn
+    import sklearn.decomposition
+    import sklearn.cluster
+    import matplotlib.pyplot as plt
+    import time
+    import pyglovewise
+    import sensor_msgs
+    import bson
+
+
+tr.init_ros("glovewise_proc_detect", True)
+
+
+class ObjectFeatureDetector:
+
+    def __init__(self, multicam):
+
+        self.detector = cv2.SIFT_create(
+            enable_precise_upscale=True
+        )
+        self.multicam = multicam
+
+        self.min_feature_size = 10
+
+        self.prev_kp = []
+        self.prev_desc = []
+
+    def detect(self, message, image, mask):
+
+        camera = self.multicam.camera_map[message.name]
+
+        viewdir = (camera.pose *
+                   tt.Vector3(0, 0, 1) - camera.pose * tt.Vector3(0, 0, 0)).value
+
+        x = message.info.roi.x_offset
+        y = message.info.roi.y_offset
+        w = message.info.roi.width
+        h = message.info.roi.height
+        x -= 16
+        y -= 54
+
+        if viewdir[2] < -0.1:
+
+            mask = mask[y:y+h, x:x+w]
+
+            mask = cv2.resize(mask, (0, 0), fx=1/message.info.binning_x,
+                              fy=1/message.info.binning_y, interpolation=cv2.INTER_AREA)
+
+            kp, desc = self.detector.detectAndCompute(image, mask)
+
+            for i in range(len(kp)):
+                kp[i].pt = kp[i].pt * \
+                    np.array([message.info.binning_x,
+                             message.info.binning_y]) + np.array([x, y])
+                kp[i].size = kp[i].size * message.info.binning_x
+
+            ii = np.array([i for i in range(len(kp))
+                           if kp[i].size > self.min_feature_size])
+            kp = [kp[i] for i in ii]
+            desc = [desc[i] for i in ii]
+
+        else:
+            kp = []
+            desc = []
+
+        ii = []
+        for i in range(len(kp)):
+            p = kp[i]
+            d = desc[i]
+            if p.pt[0] >= x + p.size and p.pt[1] >= y + p.size and p.pt[0] < x + w - p.size and p.pt[1] < y + h - p.size:
+                ii.append(i)
+        kp = [kp[i] for i in ii]
+        desc = [desc[i] for i in ii]
+
+        for i in range(len(self.prev_kp)):
+            p = self.prev_kp[i]
+            d = self.prev_desc[i]
+            if p.pt[0] < x + p.size or p.pt[1] < y + p.size or p.pt[0] >= x + w - p.size or p.pt[1] >= y + h - p.size:
+                kp.append(p)
+                desc.append(d)
+
+        self.prev_kp = kp
+        self.prev_desc = desc
+
+        return kp, np.array(desc)
+
+
+class ObjectAnalyzer:
+
+    def imshow(self, img):
+        cv2.imshow("images", img)
+        k = cv2.waitKey(0)
+        if k > 0:
+            print(k)
+            if k == 27 or k == 113:
+                exit(0)
+
+    def __init__(self, calibration):
+
+        self.visualize = 0
+
+        self.max_descriptor_distance = 200
+        self.max_feature_size_ratio = 2
+        self.max_ray_error = 0.02
+
+        self.multicam = glovewise.MultiCameraModel.load(calibration)
+
+        self.bridge = cv_bridge.CvBridge()
+
+        self.feature_detectors = {}
+        self.workspace_masks = {}
+
+        self.workspace_center = np.array([0, -.05, 0.08])
+        self.workspace_size = np.array([.3, .23, .16])
+
+        self.glove_model = glovewise.GloveModel()
+        self.glove_model.load_resource("glovewise", "/models/bonehand37s.dae")
+        self.glove_renderer = glovewise.GloveRenderer(self.glove_model)
+        self.robot_model = tt.RobotModel(self.glove_model.build_urdf(), "")
+
+        print("initrd")
+
+    def make_workspace_mask(self, camera):
+        points = [
+            self.workspace_center + self.workspace_size * [+1, -1, -1],
+            self.workspace_center + self.workspace_size * [+1, -1, +1],
+            self.workspace_center + self.workspace_size * [+1, +1, -1],
+            self.workspace_center + self.workspace_size * [+1, +1, +1],
+            self.workspace_center + self.workspace_size * [-1, -1, -1],
+            self.workspace_center + self.workspace_size * [-1, -1, +1],
+            self.workspace_center + self.workspace_size * [-1, +1, -1],
+            self.workspace_center + self.workspace_size * [-1, +1, +1],
+        ]
+        points = [camera.project_point(tt.Vector3(p)) for p in points]
+        points = [[p[0].value, p[1].value] for p in points]
+        points = np.array(points, dtype=np.int32)
+        hull = cv2.convexHull(points)
+        # print("hull", hull)
+        mask = np.zeros([1944, 2592], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, hull, 255)
+        return mask
+
+    def process_frame(self, image_set, solve_frame):
+
+        verbose = 0
+        profile = 0
+
+        images = image_set.images
+
+        imgs = [self.bridge.compressed_imgmsg_to_cv2(
+            images[image_index].image, "bgr8") for image_index in range(len(images))]
+
+        for iimg in range(len(imgs)):
+            if images[iimg].info.binning_x == 1:
+                images[iimg].info.binning_x = 2
+                images[iimg].info.binning_y = 2
+                imgs[iimg] = cv2.resize(
+                    imgs[iimg], (0, 0), fx=.5, fy=.5, interpolation=cv2.INTER_AREA)
+
+        for iimg in range(len(imgs)):
+            message = images[iimg]
+            if message.name not in self.feature_detectors:
+                self.feature_detectors[message.name] = ObjectFeatureDetector(
+                    self.multicam)
+                self.workspace_masks[message.name] = self.make_workspace_mask(
+                    self.multicam.camera_map[message.name])
+
+        keypoints = [False]*len(imgs)
+        descriptors = [False]*len(imgs)
+
+        masks = {}
+        for k in self.workspace_masks:
+            masks[k] = self.workspace_masks[k]
+
+        if solve_frame:
+
+            with glovewise.Profiler("deserialize", profile, verbose):
+                joint_states = tt.JointStates(self.robot_model)
+                joint_states.deserialize([tt.Scalar(solve_frame["joints"][n])
+                                          for n in self.robot_model.variable_names])
+
+            with glovewise.Profiler("linkstates", profile, verbose):
+                link_states = self.robot_model.forward_kinematics(joint_states)
+
+            with glovewise.Profiler("render", profile, verbose):
+                roi = sensor_msgs.msg.RegionOfInterest()
+
+                roi.x_offset = 16 * 2
+                roi.y_offset = 54 * 2
+
+                roi.width = 2592
+                roi.height = 1944
+                for iimg in range(len(image_set.images)):
+                    name = image_set.images[iimg].name
+                    camera = self.multicam.camera_map[name]
+                    mask = self.glove_renderer.render_mask(camera, link_states, (
+                        2592,
+                        1944
+                    ), roi)
+
+                    kernel = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (51, 51))
+                    mask = cv2.dilate(mask, kernel, iterations=1)
+
+                    masks[name] = (masks[name] & ~mask)
+
+            if self.visualize:
+                vertices = self.glove_model.blend_skin_from_link_states(
+                    link_states)
+                tr.visualize_mesh(
+                    "glove", [1, 1, 1, 1], vertices)
+
+        def detect_features(iimg):
+            message = images[iimg]
+            image = imgs[iimg]
+            kp, desc = self.feature_detectors[message.name].detect(
+                message, image, masks[message.name])
+            keypoints[iimg] = kp
+            descriptors[iimg] = desc
+
+        with mittenwire.Profiler("feature detection", profile, verbose):
+            pyglovewise.parallel_for(len(imgs), detect_features)
+
+        wmasks = [masks[img.name] for img in images]
+
+        if self.visualize:
+
+            with mittenwire.Profiler("visualize a", profile, verbose):
+
+                for iimg in range(len(imgs)):
+
+                    x = images[iimg].info.roi.x_offset
+                    y = images[iimg].info.roi.y_offset
+                    w = images[iimg].info.roi.width
+                    h = images[iimg].info.roi.height
+
+                    x -= 16
+                    y -= 54
+
+                    x = max(0, x)
+                    y = max(0, y)
+
+                    part = imgs[iimg]
+                    part = cv2.resize(
+                        part, (w, h), interpolation=cv2.INTER_AREA)
+
+                    w = min(w, 2592 - x)
+                    h = min(h, 1944 - y)
+
+                    full = np.zeros([1944, 2592, 3], dtype=np.uint8)
+                    full[:, :, 0] = np.copy(wmasks[iimg])
+
+                    full[y:y+h, x:x+w, :] >>= 1
+                    full[y:y+h, x:x+w, :] += (part[:h, :w, :] >> 1)
+
+                    imgs[iimg] = full
+
+                for iimg in range(len(imgs)):
+                    imgs[iimg] = cv2.drawKeypoints(
+                        imgs[iimg], keypoints[iimg], None, flags=cv2.DrawMatchesFlags_DRAW_RICH_KEYPOINTS)
+
+                mosaic = mittenwire.Mosaic(imgs, (900, 1600), (300, 400))
+                image = mosaic.render(np.uint8)
+
+        def match_features_0(matcher, da, db, k):
+            matches = matcher.knnMatch(da, db, k=k)
+            matches = [p for l in matches for p in l]
+            matches = [(p.queryIdx, p.trainIdx, p.distance)
+                       for p in matches]
+            return matches
+
+        def match_features(matcher, da, db, k):
+            a = match_features_0(matcher, da, db, k)
+            b = match_features_0(matcher, db, da, k)
+            b = [(p[1], p[0], p[2]) for p in b]
+            r = list(set(a) | set(b))
+            assert (len(r) == len(set([(p[0], p[1]) for p in r])))
+            return r
+
+        pp3 = []
+        dd3 = []
+        lines = []
+
+        pp = []
+        sss = []
+        uuu = []
+        vvv = []
+        for iimg in range(len(imgs)):
+            camera = self.multicam.camera_map[images[iimg].name]
+            pp.append(tr.position(camera.pose).value)
+            uu, vv = camera.compute_uv([kp.pt for kp in keypoints[iimg]])
+            uuu.append(uu)
+            vvv.append(vv)
+            ss = [kp.size for kp in keypoints[iimg]]
+            sss.append(ss)
+        pp = np.array(pp, dtype=np.float64)
+        uuu = [np.array(uu, dtype=np.float64) for uu in uuu]
+        vvv = [np.array(vv, dtype=np.float64) for vv in vvv]
+
+        pp3, dd3 = pyglovewise.triangulate(
+            pp, uuu, vvv, sss, descriptors, self.max_ray_error, self.max_descriptor_distance, self.max_feature_size_ratio)
+
+        mm = np.all((np.abs(pp3 - self.workspace_center)
+                    < self.workspace_size), axis=1)
+        pp3 = pp3[mm]
+        dd3 = dd3[mm]
+
+        dd3 = np.array(dd3, dtype=np.float32)
+
+        if len(pp3) and len(dd3):
+            data = np.hstack(
+                [np.full([len(pp3), 1], image_set.time.to_sec()), pp3, dd3])
+            self.visualize_features(data)
+
+        if self.visualize:
+
+            with mittenwire.Profiler("visualize b", profile, verbose):
+
+                cc3 = self.colorize_features(dd3)
+
+                for iimg in range(len(imgs)):
+                    camera = self.multicam.camera_map[images[iimg].name]
+                    for i in range(len(cc3)):
+                        color = cc3[i]
+                        color = color[::-1]
+                        color = (color * 255).astype(int)
+                        color = tuple(color.tolist())
+                        p3 = pp3[i]
+                        p2 = camera.project_point(tt.Vector3(p3))
+                        x = p2[0].value
+                        y = p2[1].value
+                        x, y = mosaic.map(iimg, x, y)
+                        if x >= 0 and y >= 0 and x < 1000000 and y < 1000000:
+                            cv2.circle(image, (x, y), 5, color,
+                                       lineType=cv2.LINE_AA)
+
+            self.imshow(image)
+
+        return pp3, dd3
+
+    def colorize_features(self, features):
+        dd3 = features
+        if len(dd3) >= 3:
+            pca = sklearn.decomposition.PCA(n_components=3)
+            cc3 = pca.fit_transform(dd3)
+        else:
+            cc3 = [(1, 2, 3) for c in dd3]
+        if len(cc3):
+            cc3 = (cc3 - np.min(cc3)) / (np.max(cc3) - np.min(cc3))
+        return cc3
+
+    def visualize_features(self, data):
+        if self.visualize:
+            data = np.array(data)
+            pp3 = data[:, 1:4]
+            dd3 = data[:, 4:]
+            cc3 = self.colorize_features(dd3)
+            cc3 = np.hstack([cc3, np.ones([cc3.shape[0], 1])])
+            tr.visualize_points("p3", 0.005, cc3, pp3)
+
+    def process_image_bag(self, bag_path):
+        self.feature_detectors = {}
+        ok = False
+
+        solve_path = glovewise.extpath(bag_path, ".solve.yaml")
+        with open(solve_path, "r") as f:
+            solve_data = yaml.load(f, Loader=yaml.CLoader)
+        solve_data = dict(zip(
+            [x["time"] for x in solve_data],
+            solve_data
+        ))
+
+        sequence_data = []
+
+        image_bag = glovewise.ImageBag(bag_path)
+        for image_set in image_bag:
+            current_time = image_set.time.to_sec()
+
+            print("processing", (current_time - image_bag.start_time) *
+                  100 / (image_bag.end_time - image_bag.start_time), "%")
+
+            if len(image_set.images) == 6:
+
+                solve_frame = None
+
+                for image in image_set.images:
+                    if image.info.roi.width >= 2592 and image.info.roi.height >= 1944:
+                        ok = True
+
+                if current_time in solve_data:
+                    solve_frame = solve_data[current_time]
+
+                positions, descriptors = self.process_frame(
+                    image_set, solve_frame)
+
+                if ok and current_time in solve_data:
+                    sequence_data.append({
+                        "time": current_time,
+                        "features": [
+                            {
+                                "position": glovewise.point2dict(positions[i]),
+                                "descriptor": [float(v) for v in descriptors[i]],
+                            }
+                            for i in range(len(positions))
+                        ]
+                    })
+
+        outpath = glovewise.extpath(bag_path, ".obj.bson")
+        print("writing", outpath)
+        with open(outpath, "wb") as outfile:
+            outfile.write(bson.dumps({
+                "object_feature_sequence": sequence_data,
+            }))
+
+        print("ready")
+
+
+bagpath = sys.argv[2]
+desc = ObjectAnalyzer(sys.argv[1])
+desc.process_image_bag(bagpath)
+time.sleep(1)

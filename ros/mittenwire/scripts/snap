@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import mittenwire
+    import rospy
+    import rosbag
+    import sdl2
+    import sys
+    import time
+    import sensor_msgs.msg
+    import statistics
+
+rospy.init_node("mittenwire", disable_signals=True)
+
+
+class App(mittenwire.App):
+
+    def __init__(self):
+        self.next_snap = []
+        self.current_snap = []
+        self.bag = None
+        self.frame_count = 0
+        super().__init__("Snap")
+
+    def run(self):
+        super().run()
+        if self.bag is not None:
+            print("closing bag")
+            self.bag.close()
+            print("bag closed")
+
+    def render(self, width, height):
+        if self.bag:
+            text = self.bag.filename + "  #" + str(self.frame_count)
+        else:
+            text = "press space to start recording"
+            if len(sys.argv) > 1:
+                text += " " + sys.argv[1]
+        return super().render(width, height, text)
+
+    def process_camera_image(self, msg):
+        super().process_camera_image(msg)
+        if len(self.next_snap) > 0 and self.next_snap[0].request_timestamp == msg.request_timestamp:
+            self.next_snap.append(msg)
+        else:
+            self.current_snap = self.next_snap
+            self.next_snap = [msg]
+
+    def snapshot(self):
+
+        images = self.current_snap
+
+        for img in images:
+            print(img, img.request_timestamp, img.width, img.height)
+
+        return images
+
+    def handle_event(self, event):
+        super().handle_event(event)
+        if event.type == sdl2.SDL_KEYDOWN:
+            if event.key.keysym.sym == sdl2.SDLK_SPACE:
+                if self.bag is None:
+                    name = "snap-"
+                    name += str(time.time_ns())
+                    if len(sys.argv) > 1:
+                        name += "-" + sys.argv[1]
+                    name += ".bag"
+                    self.bag = rosbag.Bag(name, "w")
+
+                self.frame_count += 1
+
+                t = rospy.Time.now()
+                for image in self.snapshot():
+                    self.bag.write("/cam"+str(image.channel),
+                                   self.image2ros(image), t=t)
+
+
+app = App()
+app.run()
+
+rospy.signal_shutdown("")
+
+print("exit")

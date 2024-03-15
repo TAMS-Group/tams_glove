@@ -1,0 +1,18 @@
+LOCATE COMP "pin_mclk" SITE "B16";
+LOCATE COMP "pin_ledctrl" SITE "A2";
+
+LOCATE COMP "net_clk" SITE "N1"; 
+LOCATE COMP "net_dat" SITE "M1";
+
+LOCATE COMP "gpio_pins[0]" SITE "T6";
+
+LOCATE COMP "gpio_pins[1]" SITE "P16";
+LOCATE COMP "gpio_pins[2]" SITE "R16";
+LOCATE COMP "gpio_pins[3]" SITE "M15";
+LOCATE COMP "gpio_pins[4]" SITE "M16";
+LOCATE COMP "gpio_pins[5]" SITE "J15";
+LOCATE COMP "gpio_pins[6]" SITE "J16";
+LOCATE COMP "gpio_pins[7]" SITE "D16";
+LOCATE COMP "gpio_pins[8]" SITE "E15";
+LOCATE COMP "gpio_pins[9]" SITE "C16";
+LOCATE COMP "gpio_pins[10]" SITE "C15";

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+print("load libraries")
+if 1:
+    import glovewise
+    import cv_bridge
+    import cv2
+    import numpy as np
+    import tractor as tr
+    import tractor.types_double as tt
+    import yaml
+
+
+print("load multicam")
+multicam = glovewise.MultiCameraModel.load(sys.argv[1])
+
+print("load glove model")
+glove_model = glovewise.GloveModel()
+glove_model.load_resource("glovewise", "/models/bonehand37s.dae")
+
+bridge = cv_bridge.CvBridge()
+tac_layout = glovewise.TactileLayout()
+tac_renderer = glovewise.TactileRenderer()
+motion_solver = glovewise.MotionSolver(glove_model, multicam)
+robot_model = motion_solver.robot_model
+
+
+for bag_path in sys.argv[2:]:
+
+    tac_seq = glovewise.TactileSequence.load(bag_path).process()
+    tac_interp = glovewise.TactileInterpolator(tac_seq)
+
+    solve_path = glovewise.extpath(bag_path, ".solve.yaml")
+    with open(solve_path, "r") as f:
+        solve_data = yaml.load(f, Loader=yaml.CLoader)
+
+    viz_path = glovewise.extpath(bag_path, ".viz.bag")
+    vizbag = glovewise.VizBag.create(viz_path)
+
+    print("solve_path", solve_path)
+    print("solve_data", solve_data)
+
+    tstart = solve_data[0]["time"]
+    tend = solve_data[-1]["time"]
+
+    print("visualize trajectory")
+    for solve_frame in solve_data:
+
+        current_time = solve_frame["time"]
+
+        print((current_time - tstart) * 100 / (tend - tstart))
+
+        profile = 0
+
+        with glovewise.Profiler("deserialize", profile):
+            joint_states = tt.JointStates(robot_model)
+            joint_states.deserialize([tt.Scalar(solve_frame["joints"][n])
+                                      for n in robot_model.variable_names])
+
+        with glovewise.Profiler("linkstates", profile):
+            link_states = motion_solver.glove_ik.compute_link_states(
+                joint_states)
+
+        with glovewise.Profiler("blend", profile):
+            vertices = glove_model.blend_skin_from_link_states(link_states)
+
+        with glovewise.Profiler("tac interpolate", profile):
+            tac = tac_interp.interpolate(current_time)
+            tac = tac_layout.map_matrix(tac)
+
+        with glovewise.Profiler("render write tac image", profile):
+            image = tac_renderer.render_smooth_image(tac)
+            msg = bridge.cv2_to_compressed_imgmsg(image)
+            vizbag.insert_message("/tacviz", msg, current_time)
+
+        with glovewise.Profiler("render glove tac matrix", profile):
+            image = cv2.resize(
+                tac, (tac.shape[1] * 20, tac.shape[0] * 20), interpolation=cv2.INTER_CUBIC)
+            image[image < 0] = 0
+            # image *= 0.75
+            image *= 1
+            colors = np.zeros([image.shape[0], image.shape[1], 4])
+            colors[:, :, 0] = image * 4
+            colors[:, :, 1] = image * 2
+            colors[:, :, 2] = image * 1
+            colors[:, :, 3] = 1
+            colors = np.array(colors, np.float32)
+
+        with glovewise.Profiler("write_img", profile):
+            msg = bridge.cv2_to_imgmsg(colors)
+            vizbag.insert_message("/tacc", msg, current_time)
+
+        with glovewise.Profiler("build vertex colors", profile):
+            mesh_colors = glove_model.build_tactile_colors(colors)
+
+        with glovewise.Profiler("write mesh", profile):
+            vizbag.visualize_colored_mesh_fast(
+                "glove", current_time, "glove", mesh_colors, vertices)
+
+    print("write vizbag")
+    vizbag.write()
+
+    print("finished", viz_path)

@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import yaml
+    import sys
+    import random
+    import numpy as np
+    import cv2
+    import tractor as tr
+    import tractor.types_double as tt
+    import math
+    import time
+    import scipy
+    import scipy.spatial
+    import argparse
+    import glovewise
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-i", nargs="+", required=True)
+parser.add_argument("-o", required=True)
+parser.add_argument("-f", "--fast", action="store_true")
+args = parser.parse_args()
+
+data_file_names = args.i
+output_file_name = args.o
+fast_mode = args.fast
+
+print(args)
+
+tr.init_ros("glovewise_calib_solve", True)
+
+tr.clear_visualization()
+
+data = glovewise.CameraCalibrationData()
+data.load(data_file_names)
+
+markers = data.markers
+target = data.target
+resolution = data.resolution
+camera_names = data.camera_names
+observations = data.observations
+marker_names = data.marker_names
+marker_positions = data.marker_positions
+
+print(observations)
+
+
+obj_points = []
+img_points = []
+
+for time_frame, frame_observations in observations:
+    for camera, camera_observations in frame_observations:
+        if len(camera_observations) >= 6:
+
+            op = [markers[o["marker"]] for o in camera_observations]
+            obj_points.append(op)
+
+            ip = [o["position"] for o in camera_observations]
+            ip = [(p["x"], p["y"]) for p in ip]
+            img_points.append(ip)
+
+
+obj_points = [np.array(a, dtype=np.float32) for a in obj_points]
+img_points = [np.array(a, dtype=np.float32) for a in img_points]
+
+obj_point_samples = obj_points
+img_point_samples = img_points
+
+if fast_mode:
+    samples = 50
+
+    ii = list(range(len(obj_point_samples)))
+    np.random.default_rng().shuffle(ii)
+    ii = ii[:samples]
+    obj_point_samples = [obj_point_samples[i] for i in ii]
+    img_point_samples = [img_point_samples[i] for i in ii]
+
+print("cv camcalib")
+
+flags = 0
+
+# flags |= cv2.CALIB_FIX_ASPECT_RATIO
+# flags |= cv2.CALIB_FIX_PRINCIPAL_POINT
+
+# flags |= cv2.CALIB_FIX_K1
+# flags |= cv2.CALIB_FIX_K2
+# flags |= cv2.CALIB_FIX_TANGENT_DIST
+# flags |= cv2.CALIB_FIX_K3
+
+flags |= cv2.CALIB_USE_LU
+
+print(np.all([np.all(np.isfinite(a)) for a in obj_point_samples]))
+print(np.all([np.all(np.isfinite(a)) for a in img_point_samples]))
+print(np.all(np.isfinite(resolution)))
+
+error, projection, distortion, rotations, translations = cv2.calibrateCamera(
+    obj_point_samples, img_point_samples, resolution, None, None, flags=flags)
+
+print("resolution", resolution)
+print("error", error)
+print("projection", projection)
+print("distortion", distortion)
+
+aperture_width = 5.70
+aperture_height = 4.28
+fovx, fovy, focal_length, principal_point, aspect_ratio = cv2.calibrationMatrixValues(
+    cameraMatrix=projection, imageSize=resolution, apertureWidth=aperture_width, apertureHeight=aperture_height)
+print("fov", fovx, fovy)
+print("focal_length", focal_length)
+print("principal_point", principal_point)
+print("aspect_ratio", aspect_ratio)
+
+
+def rotations_translations_to_matrices(rotations, translations):
+    return [np.vstack([cv2.hconcat([cv2.Rodrigues(rotations[i])[0], translations[i]]), [[0, 0, 0, 1]]])
+            for i in range(len(rotations))]
+
+
+def rotation_translation_to_matrix(rotation, translation):
+    return rotations_translations_to_matrices([rotation], [translation])[0]
+
+
+#
+if 0:
+    tr.visualize_points("positions", 0.01, [1, 0, 0, 1], translations)
+
+    poses = rotations_translations_to_matrices(rotations, translations)
+    print(poses)
+
+    points = np.concatenate([glovewise.transform_points_affine(
+        pose, markers.values()) for pose in poses])
+    tr.visualize_points("markers", 0.005, [0, 1, 1, 1], points)
+
+#
+
+if 0:
+
+    for time_frame, frame_observations in observations:
+
+        viz_cams = []
+        viz_obj = []
+        viz_rays = []
+
+        tr.clear_visualization()
+
+        for camera, camera_observations in frame_observations:
+            if len(camera_observations) >= 6:
+
+                op = [markers[o["marker"]] for o in camera_observations]
+
+                ip = [o["position"] for o in camera_observations]
+                ip = [(p["x"], p["y"]) for p in ip]
+
+                op = np.array(op, dtype=np.float32)
+                ip = np.array(ip, dtype=np.float32)
+
+                ok, rvec, tvec = cv2.solvePnP(op, ip, projection, distortion)
+
+                if ok:
+                    pose = rotation_translation_to_matrix(rvec, tvec)
+                    pose = np.array(pose, np.float32)
+                    print("pose", pose)
+                    pose = np.linalg.inv(pose)
+
+                    campos = transform_points_affine(pose, [[0, 0, 0]])[0]
+
+                    viz_cams.append(campos)
+
+                    print(camera)
+
+                    for marker in op:
+
+                        viz_obj.append(marker)
+
+                    pr = cv2.undistortPoints(ip, projection, distortion)
+                    print("pr", pr)
+
+                    for p in pr:
+                        q = np.array([p[0][0], p[0][1], 1])
+                        q *= 2
+                        q = transform_points_affine(pose, [q])[0]
+                        viz_rays.append(q)
+                        viz_rays.append(campos)
+
+        tr.visualize_lines("rays", 0.001, [0, .5, 1, 0.5], viz_rays)
+        tr.visualize_points("cams", 0.01, [1, 0, 0, 1], viz_cams)
+        tr.visualize_points("obj", 0.01, [1, 0, 0, 1], viz_obj)
+
+        input("press return to continue")
+
+#
+
+
+cameras = [glovewise.CameraModel(name, projection, distortion[0], resolution)
+           for name in camera_names]
+
+for cam in cameras:
+    cam.pose = tt.Pose(tt.Vector3(0, 0, 1),
+                       tt.Orientation.angle_axis(
+                           tt.Scalar(math.pi), tt.Vector3(1, 0, 0))
+                       )
+
+
+print()
+print(projection)
+print(distortion)
+
+for i in range(100):
+
+    print()
+
+    p = np.random.normal(size=(1, 3))
+
+    a, _ = cv2.projectPoints(p, (0, 0, 0), (0, 0, 0), projection, distortion)
+    a = a[0][0]
+
+    b = cameras[0].project_point(tt.Vector3(p[0]))
+    b = [v.value for v in b]
+
+    print(a)
+    print(b)
+    print(b - a)
+
+
+object_poses = [tt.Pose.identity for i in range(len(observations))]
+
+
+marker_colors = cv2.applyColorMap(np.linspace(
+    0, 255, len(marker_names), dtype=np.uint8), cv2.COLORMAP_HSV)
+marker_colors = marker_colors.astype(np.float32) * (1.0 / 255)
+np.random.default_rng(0).shuffle(marker_colors)
+marker_colors = [list(l[0]) for l in marker_colors]
+print(marker_colors)
+
+
+def visualize():
+
+    viz_cams = []
+    for camera_index in range(len(cameras)):
+        name = camera_names[camera_index]
+        camera = cameras[camera_index]
+        campos = tr.translation(camera.pose).value
+        viz_cams.append(campos)
+    tr.visualize_points("cams", 0.03, [1, 1, 1, 1], viz_cams)
+
+    viz_obj_colors = []
+    viz_obj_points = []
+
+    viz_rays_colors = []
+    viz_rays_points = []
+
+    for observation_index in range(len(observations)):
+        time_frame, frame_observations = observations[observation_index]
+        object_pose = object_poses[observation_index]
+
+        for i in range(len(markers)):
+            point = marker_positions[i]
+            viz_obj_points.append((object_pose * tt.Vector3(point)).value)
+            viz_obj_colors.append(marker_colors[i] + [1])
+
+        for camera_name, camera_observations in frame_observations:
+            camera_index = camera_names.index(camera_name)
+            camera = cameras[camera_index]
+            point_observations = [o["position"]
+                                  for o in camera_observations]
+            point_observations = [(p["x"], p["y"])
+                                  for p in point_observations]
+            point_observations = np.array(
+                point_observations, dtype=np.float32)
+            ray_directions = cv2.undistortPoints(
+                point_observations, projection, distortion)
+
+            for observation_index in range(len(camera_observations)):
+                p = ray_directions[observation_index]
+                q = np.array([p[0][0], p[0][1], 1])
+                q *= 1
+                q = camera.pose * tt.Vector3(q)
+                viz_rays_points.append(q.value)
+                viz_rays_points.append(tr.translation(camera.pose).value)
+
+                marker_index = marker_names.index(
+                    camera_observations[observation_index]["marker"])
+                color = marker_colors[marker_index]
+
+                viz_rays_colors.append(color + [0])
+                viz_rays_colors.append(color + [0.3])
+
+    tr.visualize_lines("rays", 0.0005, viz_rays_colors, viz_rays_points)
+    tr.visualize_points("obj", 0.007, viz_obj_colors, viz_obj_points)
+
+
+def calibrate(free_intrinsics):
+
+    def f():
+
+        for cam in cameras:
+            tr.variable(cam.pose)
+
+            if free_intrinsics:
+                tr.variable(cam.fx)
+                tr.variable(cam.fy)
+                tr.variable(cam.cx)
+                tr.variable(cam.cy)
+
+        for observation_index in range(len(observations)):
+            time_frame, frame_observations = observations[observation_index]
+
+            object_pose = object_poses[observation_index]
+            tr.variable(object_pose)
+
+            for camera_name, camera_observations in frame_observations:
+
+                if len(camera_observations) >= 6:
+
+                    camera_index = camera_names.index(camera_name)
+                    camera = cameras[camera_index]
+
+                    object_points = [markers[o["marker"]]
+                                     for o in camera_observations]
+
+                    point_projections = [camera.project_point(
+                        object_pose * tt.Vector3(point)) for point in object_points]
+
+                    point_observations = [o["position"]
+                                          for o in camera_observations]
+                    point_observations = [(p["x"], p["y"])
+                                          for p in point_observations]
+
+                    for i in range(len(point_projections)):
+
+                        projection = point_projections[i]
+                        observation = point_observations[i]
+
+                        for j in range(2):
+                            d = projection[j] - tt.Scalar(observation[j])
+
+                            d = tr.tanh(d * tt.Scalar(0.001))
+
+                            tr.goal(d)
+
+    print("record equation")
+    prog = tr.record(f)
+
+    print("prepare solver")
+
+    solver = tt.SparseLeastSquaresSolver(tr.DefaultEngine())
+    solver.compile(prog)
+    solver.tolerance = 0
+    solver.timeout = 10
+    solver.step_scaling = 1
+    solver.max_iterations = 1
+    solver.matrix_builder.multi_threading = False
+    solver.linear_solver = tt.SparseLinearLU()
+
+    print("solving")
+
+    regularization = 100
+    while regularization > 1e-6:
+
+        solver.regularization = regularization
+
+        for iteration in range(100):
+            print("regularization", regularization, "iteration", iteration)
+
+            if not tr.ros_ok():
+                exit(0)
+
+            for cam in cameras:
+                v = cam.pose.value
+                v = (v[0], v[1] / np.linalg.norm(v[1]))
+                cam.pose.value = v
+            for opose in object_poses:
+                v = opose.value
+                v = (v[0], v[1] / np.linalg.norm(v[1]))
+                opose.value = v
+
+            if iteration % 10 == 0:
+                visualize()
+
+            solver.gather()
+            solver.parameterize()
+            step = solver.step()
+            solver.scatter()
+
+            print("step", step)
+            print("loss", solver.loss)
+
+            if step < regularization * 1e-3:
+                print("converged")
+                break
+
+        regularization /= 2
+
+
+calibrate(False)
+
+
+print("aligning")
+
+
+def collect_observation_points():
+    points = []
+    for observation_index in range(len(observations)):
+        time_frame, frame_observations = observations[observation_index]
+        object_pose = object_poses[observation_index]
+        for i in range(len(markers)):
+            point = marker_positions[i]
+            points.append((object_pose * tt.Vector3(point)).value)
+    return points
+
+
+points = collect_observation_points()
+
+hull = scipy.spatial.ConvexHull(points=points)
+print(hull)
+print(hull.equations)
+
+if 0:
+    viz_hull = []
+    for equation in hull.equations:
+        normal = equation[:3]
+        distance = equation[3]
+        viz_hull.append(normal * -distance)
+    tr.visualize_points("hull", 0.02, (1, 0, 0, 1), viz_hull)
+
+center = np.mean(points, axis=0)
+
+
+def dist(equation):
+    normal = equation[:3]
+    distance = equation[3]
+    d = np.dot(normal, center) + distance
+    return -d
+
+
+equations = sorted(hull.equations, key=dist)
+print(equations)
+
+equation = equations[0]
+normal = equation[:3]
+distance = equation[3]
+
+if 0:
+    viz_hull = []
+    viz_hull.append(normal * -distance)
+    tr.visualize_points("hull2", 0.02, (1, 0, 0, 1), viz_hull)
+
+
+def dist(pose):
+    upvector = (tr.orientation(pose) * tt.Vector3(0, 0, 1)).value
+    return abs(np.dot(upvector, normal))
+
+
+def transform_solution(refpose):
+    for cam in cameras:
+        v = (refpose * cam.pose).value
+        v = (v[0], v[1] / np.linalg.norm(v[1]))
+        cam.pose.value = v
+    for opose in object_poses:
+        v = (refpose * opose).value
+        v = (v[0], v[1] / np.linalg.norm(v[1]))
+        opose.value = v
+
+
+refposes = sorted(object_poses, key=dist)
+refpose = refposes[-1] * tt.Pose.identity
+refpose = tt.Pose(
+    tt.Vector3(normal * -distance),
+    tr.orientation(refpose)
+)
+refpose = tr.inverse(refpose)
+transform_solution(refpose)
+
+#
+
+points = collect_observation_points()
+center = np.mean(points, axis=0)
+points = [p for p in points if p[2] <= center[2]]
+points = np.array(points, dtype=np.float32)[:, :2]
+points = np.array(points)
+print(points.shape)
+center, size, angle = cv2.minAreaRect(points)
+print(center, size, angle)
+if size[0] < size[1]:
+    angle += 90
+transform_solution(tt.Pose.angle_axis(
+    tt.Scalar(angle * math.pi / -180), tt.Vector3(0, 0, 1)))
+
+
+camcenter = np.mean(
+    [tr.translation(cam.pose).value for cam in cameras], axis=0)
+angle = (0.0 if camcenter[1] > 0 else math.pi)
+print(angle)
+transform_solution(tt.Pose.angle_axis(
+    tt.Scalar(angle), tt.Vector3(0, 0, 1)))
+
+
+for i in range(3):
+    visualize()
+
+
+multicam = glovewise.MultiCameraModel(cameras)
+
+with open(output_file_name, "w") as ofile:
+    yaml.dump({
+        "calibration_data_files": data_file_names,
+        **multicam.pack()
+    }, ofile)
+
+
+print("ready")
+time.sleep(.5)

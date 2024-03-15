@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import cv2
+    import numpy as np
+    import cv_bridge
+    import rospy
+    import glovewise
+    import rosbag
+    import mittenwire
+    import tractor as tr
+    import yaml
+    import threading
+    import tractor.types_double as tt
+    import sklearn
+    import sklearn.decomposition
+    import sklearn.cluster
+    import matplotlib.pyplot as plt
+    import time
+    import pyglovewise
+    import sensor_msgs
+    import bson
+    import lz4
+    import typing
+
+
+multicam = glovewise.MultiCameraModel.load(sys.argv[1])
+bagpath = sys.argv[2]
+datapath = glovewise.extpath(bagpath, ".fts.bson.lz4")
+with mittenwire.Profiler("read", 1, 1):
+    with open(datapath, "rb") as f:
+        data = f.read()
+with mittenwire.Profiler("decompress", 1, 1):
+    data = lz4.frame.decompress(data)
+with mittenwire.Profiler("bson", 1, 1):
+    data = bson.loads(data)
+
+
+frames = data["feature_detections"]
+
+
+def imshow(img):
+    cv2.imshow("images", img)
+    k = cv2.waitKey(0)
+    if k > 0:
+        print(k)
+        if k == 27 or k == 113:
+            exit(0)
+
+
+def decode_feature(data):
+    keypoint, octave, descriptor = data
+    x, y, size, response, angle = np.frombuffer(keypoint, dtype=np.float32)
+    keypoint = cv2.KeyPoint(
+        x, y, size, angle, response, octave
+    )
+    descriptor = np.frombuffer(descriptor, dtype=np.float32)
+    return keypoint, descriptor
+
+
+class FeatureDetection:
+    keypoint: cv2.KeyPoint
+    descriptor: np.ndarray
+
+
+class FeatureView:
+    camera: glovewise.CameraModel
+    features: typing.List[FeatureDetection]
+
+
+class FeatureFrame:
+    time: float
+    views: typing.List[FeatureView]
+
+
+class FeatureSequence:
+    frames: typing.List[FeatureFrame]
+
+
+fs = FeatureSequence()
+fs.frames = []
+for frame in frames:
+    ff = FeatureFrame()
+    ff.time = frame["time"]
+    ff.views = []
+    for view in frame["views"]:
+        fv = FeatureView()
+        fv.camera = multicam.camera_map[view["camera"]]
+        fv.features = []
+        for feature in view["features"]:
+            fd = FeatureDetection()
+            fd.keypoint, fd.descriptor = decode_feature(feature)
+            fv.features.append(fd)
+        ff.views.append(fv)
+    fs.frames.append(ff)
+
+
+all_descriptors = [
+    fd.descriptor for ff in fs.frames for fv in ff.views for fd in fv.features]
+all_descriptors = np.array(all_descriptors, dtype=np.float32)
+
+np.random.shuffle(all_descriptors)
+all_descriptors = all_descriptors[:1000, :]
+
+print(all_descriptors)
+
+
+def make_colors_i(n):
+    colors = cv2.applyColorMap(np.linspace(
+        0, 255, n, dtype=np.uint8), cv2.COLORMAP_HSV)
+    return colors
+
+
+class FeatureSeed:
+    descriptors: np.ndarray
+    colors: np.ndarray
+
+
+seeds: typing.Dict[str, FeatureSeed] = {}
+for view in fs.frames[0].views:
+    seed = FeatureSeed()
+    seed.descriptors = np.array(
+        [f.descriptor for f in view.features], dtype=np.float32)
+    seed.colors = make_colors_i(len(seed.descriptors))
+    seeds[view.camera.name] = seed
+
+matcher = cv2.BFMatcher()
+
+for frame in fs.frames:
+
+    images = []
+    for view in frame.views:
+
+        width = int(round(view.camera.width.value))
+        height = int(round(view.camera.height.value))
+
+        image = np.zeros([height, width, 3], dtype=np.uint8)
+        image += 10
+
+        seed = seeds[view.camera.name]
+
+        descriptors = np.array(
+            [f.descriptor for f in view.features], dtype=np.float32)
+        matches = matcher.knnMatch(descriptors, seed.descriptors, k=1)
+        colors = np.full([len(descriptors), 3], 255)
+        for mm in matches:
+            for m in mm:
+                if m.distance < 300:
+                    colors[m.queryIdx] = seed.colors[m.trainIdx]
+
+        for ifeature in range(len(view.features)):
+
+            feature = view.features[ifeature]
+
+            color = colors[ifeature]
+
+            color = [int(v) for v in color]
+
+            cv2.circle(image, [int(round(v)) for v in feature.keypoint.pt], int(
+                round(feature.keypoint.size * .5)), color, 4, lineType=cv2.LINE_AA)
+
+        images.append(image)
+
+    mosaic = mittenwire.make_mosaic(images, (900, 1600), (300, 400), np.uint8)
+    imshow(mosaic)

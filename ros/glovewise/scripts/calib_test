@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+
+import yaml
+import sys
+import random
+import numpy as np
+import cv2
+import tractor as tr
+import tractor.types_double as tt
+import math
+import time
+import scipy
+import scipy.spatial
+import argparse
+import glovewise
+
+
+calib_file_name = sys.argv[1]
+data_file_names = sys.argv[2:]
+
+tr.init_ros("glovewise_calib_test", True)
+
+multicam = glovewise.MultiCameraModel()
+multicam.load_calibration_file(calib_file_name)
+
+data = glovewise.CameraCalibrationData()
+data.load(data_file_names)
+
+
+for time_frame, frame_observations in data.observations:
+
+    viz_cams = []
+    viz_obj = []
+    viz_rays = []
+
+    tr.clear_visualization()
+
+    observation_map = {}
+
+    for camera_name, camera_observations in frame_observations:
+        if len(camera_observations) >= 6:
+
+            camera_index = data.camera_names.index(camera_name)
+
+            observed_marker_names = [o["marker"] for o in camera_observations]
+
+            observation_points = [o["position"] for o in camera_observations]
+            observation_points = [(p["x"], p["y"]) for p in observation_points]
+            observation_points = np.array(observation_points, dtype=np.float32)
+
+            cam = multicam.cameras[camera_index]
+
+            campos = tr.position(cam.pose).value
+
+            viz_cams.append(campos)
+
+            print(camera_name)
+            tr.visualize_text(
+                camera_name, 0.05, (1, 1, 1, 1), campos + [0, 0, 0.02], camera_name.strip("/"))
+
+            ray_directions = cam.compute_ray_directions(observation_points)
+            for q in ray_directions:
+                q *= 2
+                q = (cam.pose * tt.Vector3(q)).value
+                viz_rays.append(q)
+                viz_rays.append(campos)
+
+            for observation_index in range(len(observed_marker_names)):
+                marker_name = observed_marker_names[observation_index]
+                observation_point = observation_points[observation_index]
+                if marker_name not in observation_map:
+                    observation_map[marker_name] = {}
+                observation_map[marker_name][camera_name] = observation_point
+
+    print(observation_map)
+
+    for marker_name in observation_map:
+        with glovewise.Profiler("triangulate", 0):
+            pos = multicam.triangulate(observation_map[marker_name])
+        viz_obj.append(pos)
+
+    tr.visualize_lines("rays", 0.001, [0, .5, 1, 0.5], viz_rays)
+    tr.visualize_points("cams", 0.01, [1, 0, 0, 1], viz_cams)
+    tr.visualize_points("obj", 0.01, [1, 0, 0, 1], viz_obj)
+
+    input("press return to continue")

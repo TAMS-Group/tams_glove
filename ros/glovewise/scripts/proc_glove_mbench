@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+print("load libraries")
+if 1:
+    import glovewise
+    import numpy as np
+    import tractor as tr
+    import tractor.types_double as tt
+    import copy
+    import glovewise.glovefusion
+    import itertools
+    import random
+
+
+tr.profiler.start()
+tr.init_ros("glovewise_proc_solve", False)
+
+print("load multicam")
+multicam = glovewise.MultiCameraModel.load(sys.argv[1])
+
+print("load glove model")
+glove_model = glovewise.GloveModel()
+glove_model.load_resource("glovewise", "/models/bonehand37s.dae")
+
+glove_fusion = glovewise.glovefusion.GloveFusion(glove_model)
+
+cam_count = len(multicam.cameras)
+
+active_cams = 3
+
+for bag_path in sys.argv[2:]:
+
+    glove_fusion.load_data(bag_path)
+
+    outpath = glovewise.extpath(bag_path, ".mtest.txt")
+
+    with open(outpath, "w") as outfile:
+        pass
+
+    cam_sets = list(itertools.combinations(range(cam_count), active_cams))
+
+    for i_cam_set in range(len(cam_sets)):
+
+        cam_set = cam_sets[i_cam_set]
+
+        multicam_solve = copy.copy(multicam)
+        multicam_solve.cameras = [multicam.cameras[i]
+                                  for i in range(cam_count) if i in cam_set]
+        multicam_solve.build_camera_map()
+
+        multicam_test = copy.copy(multicam)
+        multicam_test.cameras = [multicam.cameras[i]
+                                 for i in range(cam_count) if i not in cam_set]
+        multicam_test.build_camera_map()
+
+        for regularization in [0.001, 0.01, 0.1, 1.0, 10.0]:
+
+            for use_tactile in [False, True]:
+
+                glove_fusion.motion_solver.regularization = regularization
+
+                keys = [str(use_tactile), "".join(
+                        [str(i) for i in cam_set]), str(i_cam_set), str(len(cam_sets)), str(regularization)]
+                print(keys)
+
+                glove_fusion.solve_trajectory(
+                    multicam_solve, multicam_test, use_tactile)
+
+                with open(outpath, "a") as outfile:
+                    outfile.write(
+                        " ".join(keys + [str(v) for v in glove_fusion.test_errors]) + "\n")

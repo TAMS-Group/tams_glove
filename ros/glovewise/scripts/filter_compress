@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import cv2
+    import numpy as np
+    import cv_bridge
+    import sensor_msgs
+    import rosbag
+    import mittenwire
+    import glob
+    import os
+
+
+bridge = cv_bridge.CvBridge()
+
+brightness = 2.0
+ref = np.array(
+    [[[brightness, brightness, brightness]]], dtype=np.float32)
+mittenwire.tonemap(ref)
+print("ref", ref)
+
+for pattern in sys.argv[1:]:
+
+    for iname in glob.glob(pattern):
+
+        if ".yaml." in iname:
+            continue
+
+        if ".compress." in iname:
+            continue
+
+        if ".detect." in iname:
+            continue
+
+        if "-calib." in iname:
+            continue
+
+        if iname.count(".") > 1:
+            continue
+
+        tname = iname+".compress.tmp"
+        oname = iname+".compress.bag"
+
+        if os.path.exists(oname) and os.path.getmtime(oname) > os.path.getmtime(iname):
+            print("skip")
+            continue
+
+        print(iname)
+
+        with rosbag.Bag(iname, "r") as ibag:
+
+            mcount = ibag.get_message_count()
+            mindex = 0
+
+            with rosbag.Bag(tname, "w") as obag:
+
+                for itopic, imessage, itime in ibag:
+
+                    print(iname, oname, mindex * 100 / mcount, "%")
+
+                    otopic = itopic
+                    omessage = imessage
+                    otime = itime
+
+                    if itopic.endswith("/image_raw"):
+                        otopic += "/compressed"
+
+                        img = bridge.imgmsg_to_cv2(imessage, "bgr8")
+                        img = img.astype(np.float32) * (brightness / 255)
+
+                        grayscale = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                        grayscale = cv2.cvtColor(grayscale, cv2.COLOR_GRAY2RGB)
+
+                        blur = cv2.blur(grayscale, (3, 3))
+
+                        img += (grayscale - blur) * 0.2
+
+                        mittenwire.tonemap(img)
+
+                        img /= ref[0, 0]
+
+                        img = np.clip(img, 0.0, 1.0)
+                        img = (img * 255).astype(np.uint8)
+
+                        ok, odata = cv2.imencode(
+                            ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                        if not ok:
+                            print("failed to encode image")
+                            exit(-1)
+                        odata = bytes(odata)
+
+                        omessage = sensor_msgs.msg.CompressedImage()
+                        omessage.header = imessage.header
+                        omessage.format = "jpeg"
+                        omessage.data = odata
+
+                    obag.write(otopic, omessage, otime)
+
+                    mindex += 1
+
+        os.rename(tname, oname)

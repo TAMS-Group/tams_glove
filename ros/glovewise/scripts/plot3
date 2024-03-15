@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+print("load libraries")
+if 1:
+    import glovewise
+    import cv_bridge
+    import cv2
+    import numpy as np
+    import tractor as tr
+    import tractor.types_double as tt
+    import matplotlib.pyplot as plt
+
+data = np.genfromtxt(sys.argv[1], delimiter=" ", skip_header=1, dtype=float)
+
+fig = plt.figure()
+ax = plt.axes(projection="3d")
+
+data = data[:, 1:]
+data = data.reshape([data.shape[0], -1, 3])
+
+print(data.shape)
+
+for i in range(data.shape[1]):
+    ax.plot3D(data[:, i, 0], data[:, i, 1], data[:, i, 2])
+
+plt.show()

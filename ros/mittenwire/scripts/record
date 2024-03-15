@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+
+import rospy
+import sensor_msgs
+import cv_bridge
+import numpy as np
+import cv2
+import time
+import sensor_msgs.msg
+import tamsnet.msg
+import curses
+import rosbag
+
+topics = [
+    [tamsnet.msg.ImpedanceMatrix, "/impedance_matrix"],
+    [tamsnet.msg.GloveStatus, "/glove_status"],
+    [sensor_msgs.msg.Image, "/tamscam"],
+]
+
+rospy.init_node("tamsnet_record", anonymous=True)
+
+messages = [False] * len(topics)
+
+
+def handle_message(index, message):
+    messages[index] = message
+
+
+print("subscribing")
+subscribers = [
+    rospy.Subscriber(topics[index][1], topics[index][0],
+                     lambda msg, index=index: handle_message(index, msg), queue_size=1, tcp_nodelay=True)
+    for index in range(len(topics))
+]
+
+
+def main(stdscr):
+    bag = False
+    counter = 0
+    while True:
+        stdscr.addstr(0, 0, "Recorder\n")
+        stdscr.addstr("Press SPACE to save snapshot\n")
+        stdscr.addstr("Press Q to exit")
+        stdscr.refresh()
+        k = stdscr.getkey()
+        if k == "q":
+            stdscr.addstr("exiting\n\n")
+            stdscr.refresh()
+            print("exiting")
+            break
+        if k == " ":
+            stdscr.addstr("\n\n")
+            mm = [m for m in messages]
+            err = False
+            for i in range(len(topics)):
+                if mm[i] is False:
+                    stdscr.addstr("no message for topic " +
+                                  topics[i][1] + "\n")
+                    err = True
+                else:
+                    stdscr.addstr(
+                        str(i) + " " + topics[i][1] + " " + str(topics[i][0]) + " " + str(type(mm[i])) + "\n")
+            if err:
+                stdscr.refresh()
+                continue
+            if bag is False:
+                name = "tamsnet-" + str(time.time_ns()) + ".bag"
+                stdscr.addstr("creating " + name + "\n")
+                bag = rosbag.Bag(name, "w")
+                stdscr.addstr("bag created\n")
+            counter = counter + 1
+            stdscr.addstr("saving snapshot\n")
+            for i in range(len(topics)):
+                bag.write(topics[i][1], mm[i])
+            stdscr.addstr(str(counter) + " snapshots saved\n\n")
+        stdscr.refresh()
+    if bag is not False:
+        bag.close()
+
+
+curses.wrapper(main)
+print("exiting")

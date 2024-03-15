@@ -1,0 +1,3 @@
+#!/bin/bash
+
+rosrun glovewise proc_glove_detect ${@:2} && rosrun glovewise proc_glove_solve $1 ${@:2} && rosrun glovewise proc_obj_track $1 ${@:2}

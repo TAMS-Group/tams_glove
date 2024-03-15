@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import cv2
+    import numpy as np
+    import cv_bridge
+    import rospy
+    import glovewise
+    import rosbag
+
+
+bagpath = sys.argv[1]
+outpath = glovewise.extpath(bagpath, ".tactile.bag")
+
+sequence = glovewise.TactileSequence.load(bagpath).process()
+interp = glovewise.TactileInterpolator(sequence)
+layout = glovewise.TactileLayout()
+renderer = glovewise.TactileRenderer()
+
+
+times = np.arange(
+    sequence.times[0], sequence.times[-1], 0.1)
+imagesi = [interp.interpolate(t) for t in times]
+
+imagesm = layout.map_matrices(imagesi)
+images = renderer.render_smooth_images(imagesm)
+
+
+def inflate(img):
+    s = 20
+    img = cv2.resize(img, (0, 0), fx=s, fy=s,
+                     interpolation=cv2.INTER_AREA)
+    return img
+
+
+for i in range(len(images)):
+    cv2.imshow("matrix", inflate(imagesi[i]))
+    cv2.imshow("remap", inflate(imagesm[i]))
+    cv2.imshow("smooth", images[i])
+    k = cv2.waitKey(0)
+    if k > 0:
+        print(k)
+        if k == 27 or k == 113:
+            exit(0)
+
+print("write")
+bridge = cv_bridge.CvBridge()
+with rosbag.Bag(outpath, "w") as bag:
+    for i in range(len(images)):
+        time = times[i]
+        image = images[i]
+        msg = bridge.cv2_to_compressed_imgmsg(image)
+        bag.write("/tacviz", msg, rospy.Time.from_sec(time))

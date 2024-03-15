@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+print("load libraries")
+if 1:
+    import glovewise
+    import cv_bridge
+    import cv2
+    import numpy as np
+    import tractor as tr
+    import tractor.types_double as tt
+    import yaml
+    import sklearn
+    import sklearn.decomposition
+    import mittenwire
+    import bson
+    import time
+
+print("load glove model")
+
+tr.init_ros("glovewise_proc_view", True)
+
+glove_model = glovewise.GloveModel()
+glove_model.load_resource("glovewise", "/models/bonehand37s.dae")
+
+for bag_path in sys.argv[1:]:
+
+    obj_path = glovewise.extpath(bag_path, ".track.bson")
+    with mittenwire.Profiler("load bson"):
+        with open(obj_path, "rb") as f:
+            obj_data = bson.loads(f.read())
+
+    obj_data = obj_data["object_feature_sequence"]
+
+    object_feature_times = []
+    object_feature_positions = []
+    object_feature_descriptors = []
+    object_feature_visibility = []
+    for obj_frame in obj_data:
+        t = obj_frame["time"]
+        object_feature_times.append(t)
+        object_feature_positions.append(
+            [glovewise.dict2point(f["position"]) for f in obj_frame["features"]])
+        object_feature_descriptors.append(
+            [f["descriptor"] for f in obj_frame["features"]])
+        object_feature_visibility.append(
+            [f["active"] for f in obj_frame["features"]])
+
+    all_object_feature_descriptors = [
+        i for o in object_feature_descriptors for i in o]
+
+    # print(all_object_feature_descriptors)
+    print("fit object feature pca")
+    object_feature_pca = sklearn.decomposition.PCA(n_components=3)
+    object_feature_pca.fit(all_object_feature_descriptors)
+
+    print("glove")
+    solve_path = glovewise.extpath(bag_path, ".solve.yaml")
+    with open(solve_path, "r") as f:
+        solve_data = yaml.load(f, Loader=yaml.CLoader)
+
+    bridge = cv_bridge.CvBridge()
+    tac_layout = glovewise.TactileLayout()
+    tac_renderer = glovewise.TactileRenderer()
+    robot_model = tt.RobotModel(glove_model.build_urdf(), "")
+
+    tac_seq = glovewise.TactileSequence.load(bag_path).process()
+
+    print("solve_path", solve_path)
+    print("solve_data", solve_data)
+
+    tstart = solve_data[0]["time"]
+    tend = solve_data[-1]["time"]
+
+    tac_interp = glovewise.TactileInterpolator(tac_seq, tstart)
+
+    print("visualize trajectory")
+    while True:
+
+        prev_time = None
+
+        object_feature_index = 0
+
+        for solve_frame in solve_data:
+
+            if not tr.ros_ok():
+                exit(0)
+
+            current_time = solve_frame["time"]
+
+            print((current_time - tstart) * 100 / (tend - tstart))
+
+            profile = 0
+
+            if True:
+                while object_feature_index + 1 < len(object_feature_times) and \
+                        object_feature_times[object_feature_index] < current_time:
+                    object_feature_index += 1
+
+                visibility = object_feature_visibility[object_feature_index]
+                positions = object_feature_positions[object_feature_index]
+                descriptors = object_feature_descriptors[object_feature_index]
+                if len(descriptors):
+                    colors = object_feature_pca.transform(descriptors)
+                    colors -= np.min(colors)
+                    colors /= np.max(colors)
+                    colors = np.hstack([colors, np.ones([colors.shape[0], 1])])
+                    for i in range(len(positions)):
+                        if not visibility[i]:
+                            colors[i] = [1, 0, 0, 1]
+                    tr.visualize_points(
+                        "object_features", 0.01, colors, positions)
+
+            with glovewise.Profiler("deserialize", profile):
+                joint_states = tt.JointStates(robot_model)
+                joint_states.deserialize([tt.Scalar(solve_frame["joints"][n])
+                                          for n in robot_model.variable_names])
+
+            with glovewise.Profiler("linkstates", profile):
+                link_states = robot_model.forward_kinematics(joint_states)
+
+            with glovewise.Profiler("blend", profile):
+                vertices = glove_model.blend_skin_from_link_states(link_states)
+
+            with glovewise.Profiler("tac interpolate", profile):
+                tac = tac_interp.interpolate(current_time)
+                tac = tac_layout.map_matrix(tac)
+
+            with glovewise.Profiler("render glove tac matrix", profile):
+                image = cv2.resize(
+                    tac, (tac.shape[1] * 20, tac.shape[0] * 20), interpolation=cv2.INTER_CUBIC)
+                image[image < 0] = 0
+                image *= 2
+                colors = np.zeros([image.shape[0], image.shape[1], 4])
+                colors[:, :, 0] = image * 4
+                colors[:, :, 1] = image * 2
+                colors[:, :, 2] = image * 1
+                colors[:, :, 3] = 1
+                colors = np.array(colors, np.float32)
+
+            with glovewise.Profiler("build vertex colors", profile):
+                mesh_colors = glove_model.build_tactile_colors(colors)
+
+            with glovewise.Profiler("write mesh", profile):
+                tr.visualize_mesh(
+                    "glove", mesh_colors, vertices)
+
+            if prev_time is not None:
+                time.sleep(current_time - prev_time)
+            prev_time = current_time

@@ -1,0 +1,11 @@
+
+unwrap/unwrap
+vlsi/build/*
+**/*.pyc
+.vscode
+*.zip
+*.vcd
+*.lxt
+*.history
+!.gitignore
+!.clang-format

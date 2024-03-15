@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+
+import rospy
+import mittenwire.msg
+import cstruct
+import struct
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+from thirdparty import tv1d
+
+rospy.init_node("mittenwire_tacfilter", disable_signals=False)
+
+history = []
+fftviz = False
+
+pub_mat = rospy.Publisher("impedance_matrix_f", mittenwire.msg.ImpedanceMatrix,
+                          latch=False, queue_size=100)
+
+sample_rate = 50
+
+
+def handle_packet(message):
+    global history, fftviz
+
+    history.append(np.array(message.quadrature, dtype=float) + 1j *
+                   np.array(message.inphase, dtype=float))
+
+    if len(history) > 10:
+        history = history[1:]
+
+    d = np.array(history)
+
+    window = np.kaiser(d.shape[0], 3)
+    window = window / np.sum(window)
+    d = d * np.repeat(window.reshape([d.shape[0], 1]), d.shape[1], axis=1)
+    d = np.mean(d, axis=0)
+
+    message.inphase = np.real(d)
+    message.quadrature = np.imag(d)
+
+    pub_mat.publish(message)
+
+
+sub = rospy.Subscriber(
+    "impedance_matrix", mittenwire.msg.ImpedanceMatrix, callback=handle_packet, queue_size=10000)
+
+rospy.spin()

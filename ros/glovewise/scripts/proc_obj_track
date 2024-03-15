@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import cv2
+    import numpy as np
+    import cv_bridge
+    import rospy
+    import glovewise
+    import rosbag
+    import mittenwire
+    import tractor as tr
+    import yaml
+    import threading
+    import tractor.types_double as tt
+    import sklearn
+    import sklearn.decomposition
+    import sklearn.cluster
+    import matplotlib.pyplot as plt
+    import time
+    import pyglovewise
+    import sensor_msgs
+    import bson
+    import lz4
+    from ortools.sat.python import cp_model
+    import typing
+
+tr.init_ros("glovewise_proc_track", False)
+
+
+def imshow(img):
+    cv2.imshow("images", img)
+    k = cv2.waitKey(1)
+    if k > 0:
+        print(k)
+        if k == 27 or k == 113:
+            exit(0)
+
+
+def print_matrix(mat):
+    for row in mat:
+        print("".join([str(v) for v in row]))
+
+
+def solve_cover(cover_matrix):
+    mdl = cp_model.CpModel()
+    vars = []
+    for irow in range(cover_matrix.shape[0]):
+        var = mdl.NewBoolVar(str(irow))
+        vars.append(var)
+
+    cost = None
+    for var in vars:
+        if cost is None:
+            cost = var
+        else:
+            cost = cost + var
+    mdl.Minimize(cost)
+
+    for icol in range(cover_matrix.shape[1]):
+        vv = []
+        for irow in range(cover_matrix.shape[0]):
+            if cover_matrix[irow, icol]:
+                vv.append(vars[irow])
+        mdl.AddAtLeastOne(vv)
+
+    solver = cp_model.CpSolver()
+    status = solver.Solve(mdl)
+
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        print("solution found")
+    else:
+        print("No solution found.")
+        exit(-1)
+
+    solution = [solver.Value(v) for v in vars]
+    print(solution)
+
+    indices = [i for i in range(len(solution)) if solution[i]]
+
+    return indices
+
+
+class TrackingPoint:
+    position: np.ndarray
+    cameras: typing.List[glovewise.CameraModel]
+    descriptor: np.ndarray
+    size: float
+    hit: float
+    velocity: np.ndarray
+    filter: cv2.KalmanFilter
+    filtered_position: np.ndarray
+
+
+class ObjectFeatureTracker:
+
+    all_tracking_points: typing.List[TrackingPoint]
+    active_tracking_points: typing.List[TrackingPoint]
+
+    def __init__(self, calibration):
+
+        self.max_descriptor_distance = 200
+        self.max_feature_size_ratio = 3
+        self.max_ray_error = 0.02
+        self.min_feature_size = 10
+        self.max_feature_size = 70
+        self.max_tracking_error = 25
+        self.descriptor_snap_distance = 200
+        self.ray_snap_distance = 0.02
+
+        self.bridge = cv_bridge.CvBridge()
+
+        self.workspace_center = np.array([0, -.05, 0.08])
+        self.workspace_size = np.array([.3, .23, .16])
+
+        self.glove_model = glovewise.GloveModel()
+        self.glove_model.load_resource("glovewise", "/models/bonehand37s.dae")
+        self.glove_renderer = glovewise.GloveRenderer(self.glove_model)
+        self.robot_model = tt.RobotModel(self.glove_model.build_urdf(), "")
+
+        self.multicam = glovewise.MultiCameraModel.load(calibration)
+
+        self.detector = cv2.SIFT_create(
+            enable_precise_upscale=True
+        )
+
+        self.active_tracking_points = None
+        self.all_tracking_points = None
+
+        self.make_workspace_masks()
+
+        print("initrd")
+
+    def make_workspace_masks(self):
+        self.workspace_masks = {}
+        for camera in self.multicam.cameras:
+            self.workspace_masks[camera.name] = self.make_workspace_mask(
+                camera)
+
+    def make_workspace_mask(self, camera):
+        points = [
+            self.workspace_center + self.workspace_size * [+1, -1, -1],
+            self.workspace_center + self.workspace_size * [+1, -1, +1],
+            self.workspace_center + self.workspace_size * [+1, +1, -1],
+            self.workspace_center + self.workspace_size * [+1, +1, +1],
+            self.workspace_center + self.workspace_size * [-1, -1, -1],
+            self.workspace_center + self.workspace_size * [-1, -1, +1],
+            self.workspace_center + self.workspace_size * [-1, +1, -1],
+            self.workspace_center + self.workspace_size * [-1, +1, +1],
+        ]
+        points = [camera.project_point(tt.Vector3(p)) for p in points]
+        points = [[p[0].value, p[1].value] for p in points]
+        points = np.array(points, dtype=np.int32)
+        hull = cv2.convexHull(points)
+        mask = np.zeros([1944, 2592], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, hull, 255)
+        return mask
+
+    def process_frame(self, image_set, solve_frame):
+
+        visualize = 1
+        verbose = 0
+        profile = 1
+
+        with glovewise.Profiler("process_frame", profile, verbose):
+
+            with glovewise.Profiler("convert images", profile, verbose):
+                imgs = [self.bridge.compressed_imgmsg_to_cv2(
+                    image_set.images[image_index].image, "bgr8") for image_index in range(len(image_set.images))]
+
+            imgs0 = [img for img in imgs]
+
+            for iimg in range(len(imgs)):
+                if image_set.images[iimg].info.binning_x == 1:
+                    image_set.images[iimg].info.binning_x = 2
+                    image_set.images[iimg].info.binning_y = 2
+                    imgs[iimg] = cv2.resize(
+                        imgs[iimg], (0, 0), fx=.5, fy=.5, interpolation=cv2.INTER_AREA)
+
+            keypoints = [[] for iimg in range(len(imgs))]
+            descriptors = [[] for iimg in range(len(imgs))]
+
+            if self.active_tracking_points:
+
+                with glovewise.Profiler("optical flow", profile, verbose):
+
+                    for tp in self.active_tracking_points:
+                        tp.prev_pos = tp.position
+                        tp.observation_map = {}
+                        tp.ok_count = 0
+
+                    for iimg in range(len(imgs)):
+                        camera = self.multicam.camera_map[image_set.images[iimg].name]
+                        tpoints = [
+                            tp for tp in self.active_tracking_points if (camera in tp.cameras)]
+
+                        next_msg = image_set.images[iimg]
+                        next_img = imgs[iimg]
+
+                        iprev = [m.name for m in self.prev_image_set.images].index(
+                            camera.name)
+                        prev_msg = self.prev_image_set.images[iprev]
+                        prev_img = self.prev_imgs[iprev]
+
+                        if next_img.shape != prev_img.shape:
+                            print(next_img.shape, prev_img.shape)
+                            for tp in tpoints:
+                                tp.ok_count += 1
+                            continue
+
+                        prev_pts = [camera.project_point(
+                            tt.Vector3(tp.position)) for tp in tpoints]
+                        prev_pts = [[
+                            (p[0].value - (prev_msg.info.roi.x_offset - 16)) /
+                            prev_msg.info.roi.width * prev_img.shape[1],
+                            (p[1].value - (prev_msg.info.roi.y_offset - 54)) /
+                            prev_msg.info.roi.height * prev_img.shape[0],
+                        ] for p in prev_pts]
+
+                        if len(prev_pts) > 0:
+
+                            next_pts, status, err = cv2.calcOpticalFlowPyrLK(
+                                prev_img, next_img, np.array(
+                                    prev_pts, dtype=np.float32), None                    #
+                                , maxLevel=5, winSize=(51, 51)
+                            )
+
+                            next_pts = [[
+                                p[0] / next_img.shape[1] * next_msg.info.roi.width +
+                                (next_msg.info.roi.x_offset - 16),
+                                p[1] / next_img.shape[0] * next_msg.info.roi.height +
+                                (next_msg.info.roi.y_offset - 54),
+                            ] for p in next_pts]
+
+                            for i in range(len(tpoints)):
+                                tpoint = tpoints[i]
+                                padding = max(51, tpoint.size) / 2
+                                if prev_pts[i][0] >= padding and prev_pts[i][0] < prev_img.shape[1] - padding and prev_pts[i][1] >= padding and prev_pts[i][1] < prev_img.shape[0] - padding:
+                                    if status[i][0] and err[i][0] < self.max_tracking_error:
+                                        # print("err", err[i])
+                                        tpoint.observation_map[camera.name] = next_pts[i]
+                                        tpoint.ok_count += 1
+                                    else:
+                                        print("point lost",
+                                              status[i][0], err[i][0])
+                                else:
+                                    tpoint.ok_count += 1
+
+                    for tp in self.active_tracking_points:
+                        if len(tp.observation_map) >= 2:
+                            p3 = self.multicam.triangulate(tp.observation_map)
+                            if p3 is not None:
+                                tp.velocity = p3 - tp.position
+                                tp.position = p3
+                                tp.cameras = [self.multicam.camera_map[name]
+                                              for name in tp.observation_map]
+
+            masks = {}
+            for k in self.workspace_masks:
+                masks[k] = self.workspace_masks[k]
+
+            with glovewise.Profiler("deserialize joints", profile, verbose):
+                joint_states = tt.JointStates(self.robot_model)
+                joint_states.deserialize([tt.Scalar(solve_frame["joints"][n])
+                                          for n in self.robot_model.variable_names])
+
+            with glovewise.Profiler("compute link states", profile, verbose):
+                link_states = self.robot_model.forward_kinematics(joint_states)
+
+            with glovewise.Profiler("meshing glove", profile, verbose):
+                glove_mesh = self.glove_model.blend_skin_from_link_states(
+                    link_states)
+
+            if self.active_tracking_points is None:
+
+                with glovewise.Profiler("rendering mask", profile, verbose):
+                    roi = sensor_msgs.msg.RegionOfInterest()
+
+                    roi.x_offset = 16 * 2
+                    roi.y_offset = 54 * 2
+
+                    roi.width = 2592
+                    roi.height = 1944
+                    for iimg in range(len(image_set.images)):
+                        name = image_set.images[iimg].name
+                        camera = self.multicam.camera_map[name]
+                        mask = self.glove_renderer.render_mask(camera, link_states, (
+                            2592,
+                            1944
+                        ), roi)
+
+                        kernel = cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE, (51, 51))
+                        mask = cv2.dilate(mask, kernel, iterations=1)
+
+                        masks[name] = (masks[name] & ~mask)
+
+            if 1:
+                with glovewise.Profiler("feature detection", profile, verbose):
+
+                    def detect_features(iimg):
+
+                        camera = self.multicam.camera_map[image_set.images[iimg].name]
+
+                        message = image_set.images[iimg]
+
+                        x = message.info.roi.x_offset
+                        y = message.info.roi.y_offset
+                        w = message.info.roi.width
+                        h = message.info.roi.height
+                        x -= 16
+                        y -= 54
+
+                        mask = masks[camera.name]
+                        mask = mask[y:y+h, x:x+w]
+                        mask = cv2.resize(mask, (0, 0), fx=1/message.info.binning_x,
+                                          fy=1/message.info.binning_y, interpolation=cv2.INTER_AREA)
+
+                        kp, desc = self.detector.detectAndCompute(
+                            imgs[iimg], mask)
+
+                        for i in range(len(kp)):
+                            kp[i].pt = kp[i].pt * \
+                                np.array([message.info.binning_x,
+                                          message.info.binning_y]) + np.array([x, y])
+                            kp[i].size = kp[i].size * message.info.binning_x
+
+                        ii = np.array([i for i in range(len(kp))
+                                       if kp[i].size >= self.min_feature_size and kp[i].size <= self.max_feature_size])
+                        kp = [kp[i] for i in ii]
+                        desc = [desc[i] for i in ii]
+
+                        keypoints[iimg] = kp
+                        descriptors[iimg] = desc
+
+                    pyglovewise.parallel_for(len(imgs), detect_features)
+
+            if self.active_tracking_points:
+
+                with glovewise.Profiler("snapping", profile, verbose):
+
+                    for tp in self.active_tracking_points:
+                        tp.observation_map = {}
+                        tp.descriptor_list = []
+                        tp.snap_count = 0
+
+                    for iimg in range(len(imgs)):
+                        camera = self.multicam.camera_map[image_set.images[iimg].name]
+                        campos = tr.position(camera.pose).value
+
+                        uu, vv = camera.compute_uv(
+                            [kp.pt for kp in keypoints[iimg]])
+
+                        msg = image_set.images[iimg]
+
+                        for tp in self.active_tracking_points:
+
+                            best_point = None
+                            best_dist2 = None
+
+                            for idet in range(len(keypoints[iimg])):
+
+                                projpos = camera.project_point(
+                                    tt.Vector3(tp.position))
+                                projpos = [v.value for v in projpos]
+
+                                padding = tp.size / 2
+                                if projpos[0] < msg.info.roi.x_offset + padding \
+                                        or projpos[0] >= msg.info.roi.x_offset + msg.info.roi.width - padding \
+                                        or projpos[1] < msg.info.roi.y_offset + padding \
+                                        or projpos[1] >= msg.info.roi.y_offset + msg.info.roi.height - padding:
+                                    continue
+
+                                dx = np.dot(uu[idet], tp.prev_pos - campos)
+                                dy = np.dot(vv[idet], tp.prev_pos - campos)
+                                prev_dist2 = dx * dx + dy * dy
+
+                                dx = np.dot(uu[idet], tp.position - campos)
+                                dy = np.dot(vv[idet], tp.position - campos)
+                                next_dist2 = dx * dx + dy * dy
+
+                                dist2 = min(prev_dist2, next_dist2)
+
+                                if dist2 > self.ray_snap_distance * self.ray_snap_distance:
+                                    continue
+
+                                da = descriptors[iimg][idet]
+                                db = tp.descriptor
+                                dd = (da + db) * 0.5 - da
+                                d2 = np.dot(dd, dd)
+                                if d2 > self.descriptor_snap_distance * self.descriptor_snap_distance:
+                                    continue
+
+                                if best_dist2 is None or dist2 < best_dist2:
+                                    best_point = keypoints[iimg][idet].pt
+                                    best_dist2 = dist2
+
+                            if best_point is not None:
+                                tp.snap_count += 1
+                                tp.observation_map[camera.name] = best_point
+
+                    for tp in self.active_tracking_points:
+                        if len(tp.observation_map) >= 2:
+                            p3 = self.multicam.triangulate(tp.observation_map)
+                            if p3 is not None:
+                                tp.position = p3
+                                tp.cameras = [self.multicam.camera_map[name]
+                                              for name in tp.observation_map]
+
+            if self.active_tracking_points:
+                self.active_tracking_points = [
+                    tp for tp in self.active_tracking_points if (tp.ok_count >= 2 or tp.snap_count >= 2)]
+
+            if self.active_tracking_points is None:
+                with glovewise.Profiler("ray casting", profile, verbose):
+                    pp = []
+                    sss = []
+                    uuu = []
+                    vvv = []
+                    for iimg in range(len(imgs)):
+                        camera = self.multicam.camera_map[image_set.images[iimg].name]
+                        pp.append(tr.position(camera.pose).value)
+                        uu, vv = camera.compute_uv(
+                            [kp.pt for kp in keypoints[iimg]])
+                        uuu.append(uu)
+                        vvv.append(vv)
+                        ss = [kp.size for kp in keypoints[iimg]]
+                        sss.append(ss)
+                    pp = np.array(pp, dtype=np.float64)
+                    uuu = [np.array(uu, dtype=np.float64) for uu in uuu]
+                    vvv = [np.array(vv, dtype=np.float64) for vv in vvv]
+
+                    pp3, dd3 = pyglovewise.triangulate(
+                        pp, uuu, vvv, sss, descriptors, self.max_ray_error, self.max_descriptor_distance, self.max_feature_size_ratio)
+
+                    cover = pyglovewise.raycheck(
+                        pp3, dd3, pp, uuu, vvv, descriptors, self.max_ray_error, self.max_descriptor_distance)
+                    print(cover)
+
+                    active = list(set([p for a in cover for p in a]))
+                    print(active)
+
+                    cover_matrix = np.zeros(
+                        [len(cover), len(active)], dtype=int)
+                    for irow in range(len(cover)):
+                        for pair in cover[irow]:
+                            cover_matrix[irow, active.index(pair)] = 1
+                    print_matrix(cover_matrix)
+
+                    indices = solve_cover(cover_matrix)
+
+                    print(indices)
+                    print_matrix(cover_matrix[indices])
+
+                    self.active_tracking_points = []
+                    for row in cover_matrix[indices]:
+                        observation_map = {}
+                        cams = []
+                        descs = []
+                        sizes = []
+                        for icol in range(cover_matrix.shape[1]):
+                            if row[icol]:
+                                iimg, ift = active[icol]
+                                camera_name = image_set.images[iimg].name
+                                point = keypoints[iimg][ift].pt
+                                desc = descriptors[iimg][ift]
+                                observation_map[camera_name] = point
+                                cams.append(
+                                    self.multicam.camera_map[camera_name])
+                                descs.append(desc)
+                                sizes.append(keypoints[iimg][ift].size)
+                        p3 = self.multicam.triangulate(observation_map)
+                        tp = TrackingPoint()
+                        tp.velocity = np.zeros(3)
+                        tp.position = p3
+                        tp.cameras = cams
+                        tp.descriptor = np.mean(descs, axis=0)
+                        tp.size = np.mean(sizes)
+                        tp.hit = 0.0
+                        tp.filter = cv2.KalmanFilter(
+                            dynamParams=6, measureParams=6, controlParams=0, type=cv2.CV_64F)
+                        tp.filter.measurementMatrix = np.identity(
+                            6, dtype=np.float64)
+                        tp.filter.transitionMatrix = np.array([
+                            [1, 0, 0, 1, 0, 0],
+                            [0, 1, 0, 0, 1, 0],
+                            [0, 0, 1, 0, 0, 1],
+                            [0, 0, 0, 1, 0, 0],
+                            [0, 0, 0, 0, 1, 0],
+                            [0, 0, 0, 0, 0, 1],
+                        ], dtype=np.float64)
+                        tp.filter.measurementNoiseCov = np.diag(np.square(np.array([
+                            0.01,
+                            0.01,
+                            0.01,
+                            0.001,
+                            0.001,
+                            0.001,
+                        ], dtype=np.float64)))
+                        tp.filter.processNoiseCov = np.identity(
+                            6, dtype=np.float64) * np.square(0.001)
+                        state = np.concatenate([tp.position, tp.velocity])
+                        tp.filter.statePre = state
+                        tp.filter.statePost = state
+                        print("filter")
+                        print("measurementMatrix", tp.filter.measurementMatrix)
+                        print("measurementNoiseCov",
+                              tp.filter.measurementNoiseCov)
+                        print("processNoiseCov", tp.filter.processNoiseCov)
+                        print("transitionMatrix", tp.filter.transitionMatrix)
+                        self.active_tracking_points.append(tp)
+                    self.all_tracking_points = [
+                        p for p in self.active_tracking_points]
+
+            if self.active_tracking_points:
+                for pt in self.active_tracking_points:
+                    pt.filter.correct(np.concatenate(
+                        [pt.position, pt.velocity]))
+                    pt.filtered_position = pt.filter.predict().flatten()[:3]
+                    print(pt.filtered_position)
+
+            with glovewise.Profiler("visualizing", profile, verbose):
+                hit_points = []
+                hit_lines = []
+                if self.active_tracking_points is not None:
+                    for tp in self.active_tracking_points:
+                        a = tp.position + [0, 0, 0.01]
+                        b = tp.position + [0, 0, 1]
+                        hit = pyglovewise.meshline(
+                            glove_mesh, a, b)
+                        fhit = 0.0
+                        if hit and hit[2] > a[2]:
+                            fhit = 1.0
+                            hit_points.append(hit)
+                            hit_points.append(a)
+                            hit_points.append(b)
+                            hit_lines.append(a)
+                            hit_lines.append(b)
+                            print("hit", hit)
+                        tp.hit = tp.hit * 0.8 + fhit * 0.2
+                    self.active_tracking_points = [
+                        tp for tp in self.active_tracking_points if tp.hit < 0.5]
+
+                if visualize:
+
+                    with glovewise.Profiler("viz msg", profile, verbose):
+                        tr.visualize_points("p3", 0.005, (0, 0, 1, 1), [
+                                            tp.position for tp in self.active_tracking_points])
+                        tr.visualize_points("filtered", 0.005, (1, 1, 1, 1), [
+                                            tp.filtered_position for tp in self.active_tracking_points])
+                        tr.visualize_points(
+                            "hits", 0.01, (1, 0, 1, 1), hit_points)
+                        tr.visualize_lines("hitlines", 0.003,
+                                           (1, 0, 1, 1), hit_lines)
+                        tr.visualize_mesh("glove", [1, 1, 1, 1], glove_mesh)
+                        flowlines = []
+                        for tp in self.active_tracking_points:
+                            if tp.velocity is not None:
+                                d = tp.velocity * 10
+                                flowlines.append(tp.filtered_position - d)
+                                flowlines.append(tp.filtered_position + d)
+                        tr.visualize_lines("flowlines", 0.003,
+                                           (1, 1, 1, 1), flowlines)
+
+                    def imviz(iimg):
+                        profile = False
+                        verbose = False
+                        with glovewise.Profiler("imviz1", profile, verbose):
+                            camera = self.multicam.camera_map[image_set.images[iimg].name]
+
+                            x = image_set.images[iimg].info.roi.x_offset
+                            y = image_set.images[iimg].info.roi.y_offset
+                            w = image_set.images[iimg].info.roi.width
+                            h = image_set.images[iimg].info.roi.height
+
+                            x -= 16
+                            y -= 54
+
+                            x = max(0, x)
+                            y = max(0, y)
+
+                            part = imgs[iimg]
+
+                            with glovewise.Profiler("imviz resize", profile, verbose):
+                                part = cv2.resize(
+                                    part, (w, h), interpolation=cv2.INTER_NEAREST)
+
+                            cw = int(round(camera.width.value))
+                            ch = int(round(camera.height.value))
+
+                            w = min(w, cw - x)
+                            h = min(h, ch - y)
+
+                            with glovewise.Profiler("imviz zero", profile, verbose):
+                                full = np.zeros([ch, cw, 3], dtype=np.uint8)
+
+                            with glovewise.Profiler("imviz mask", profile, verbose):
+                                full[:, :, 0] = self.workspace_masks[camera.name]
+
+                            with glovewise.Profiler("imviz mix", profile, verbose):
+                                full[y:y+h, x:x+w, :] >>= 1
+                                full[y:y+h, x:x+w, :] += (part[:h, :w, :] >> 1)
+
+                            imgs[iimg] = full
+
+                    with glovewise.Profiler("viz bg", profile, verbose):
+                        pyglovewise.parallel_for(len(imgs), imviz)
+
+                    with glovewise.Profiler("viz circles", profile, verbose):
+                        line_type = 0
+                        thickness = 4
+                        for iimg in range(len(imgs)):
+                            for ipoint in range(len(keypoints[iimg])):
+                                p = keypoints[iimg][ipoint]
+                                c = (0, 0, 255)
+                                cv2.circle(imgs[iimg], [int(round(v)) for v in p.pt], int(
+                                    round(p.size * .5)), c, thickness, lineType=line_type)
+                        for iimg in range(len(imgs)):
+                            camera = self.multicam.camera_map[image_set.images[iimg].name]
+                            for tp in self.active_tracking_points:
+                                color = (255, 255, 0)
+                                p2 = camera.project_point(
+                                    tt.Vector3(tp.position))
+                                x = int(round(p2[0].value))
+                                y = int(round(p2[1].value))
+                                if x >= 0 and y >= 0 and x < 1000000 and y < 1000000:
+                                    cv2.circle(imgs[iimg], (x, y), 20, color, thickness,
+                                               lineType=line_type)
+
+                    with glovewise.Profiler("viz mosaic", profile, verbose):
+                        mosaic = mittenwire.make_mosaic(
+                            imgs, (900, 1600), (300, 400), np.uint8)
+
+                    with glovewise.Profiler("viz show", profile, verbose):
+                        imshow(mosaic)
+
+            self.prev_image_set = image_set
+            self.prev_imgs = imgs0
+
+            return [tp.filtered_position for tp in self.all_tracking_points], \
+                [tp.descriptor for tp in self.all_tracking_points], \
+                [(tp in self.active_tracking_points)
+                 for tp in self.all_tracking_points]
+
+
+for bag_path in sys.argv[2:]:
+
+    outpath = glovewise.extpath(bag_path, ".track.bag")
+
+    tracker = ObjectFeatureTracker(sys.argv[1])
+
+    ok = False
+
+    solve_path = glovewise.extpath(bag_path, ".solve.yaml")
+    with open(solve_path, "r") as f:
+        solve_data = yaml.load(f, Loader=yaml.CLoader)
+    solve_data_map = dict(zip(
+        [x["time"] for x in solve_data],
+        solve_data
+    ))
+
+    sequence_data = []
+
+    image_bag = glovewise.ImageBag(bag_path)
+    for image_set in image_bag:
+        current_time = image_set.time.to_sec()
+
+        print("processing", (current_time - image_bag.start_time) *
+              100 / (image_bag.end_time - image_bag.start_time), "%")
+
+        if len(image_set.images) == 6:
+
+            solve_frame = None
+
+            for image in image_set.images:
+                if image.info.roi.width >= 2592 and image.info.roi.height >= 1944:
+                    ok = True
+
+            if current_time in solve_data_map:
+                solve_frame = solve_data_map[current_time]
+            else:
+                solve_frame = solve_data[0]
+
+            if ok:
+                positions, descriptors, active = tracker.process_frame(
+                    image_set, solve_frame)
+
+                sequence_data.append({
+                    "time": current_time,
+                    "features": [
+                        {
+                            "position": glovewise.point2dict(positions[i]),
+                            "descriptor": [float(v) for v in descriptors[i]],
+                            "active": active[i]
+                        }
+                        for i in range(len(positions))
+                    ]
+                })
+
+    outpath = glovewise.extpath(bag_path, ".track.bson")
+    print("writing", outpath)
+    with open(outpath, "wb") as outfile:
+        outfile.write(bson.dumps({
+            "object_feature_sequence": sequence_data,
+        }))

@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+print("load libraries")
+if 1:
+    import glovewise
+    import cv_bridge
+    import cv2
+    import numpy as np
+    import tractor as tr
+    import tractor.types_double as tt
+    import yaml
+    import sklearn
+    import sklearn.decomposition
+    import mittenwire
+    import bson
+    import sklearn.linear_model
+    import sklearn.decomposition
+
+print("load glove model")
+
+tr.init_ros("glovewise_proc_dump", True)
+
+glove_model = glovewise.GloveModel()
+glove_model.load_resource("glovewise", "/models/bonehand37s.dae")
+
+for bag_path in sys.argv[1:]:
+
+    obj_path = glovewise.extpath(bag_path, ".track.bson")
+    with mittenwire.Profiler("load bson"):
+        with open(obj_path, "rb") as f:
+            obj_data = bson.loads(f.read())
+
+    print("glove")
+    solve_path = glovewise.extpath(bag_path, ".solve.yaml")
+    with open(solve_path, "r") as f:
+        solve_data = yaml.load(f, Loader=yaml.CLoader)
+
+    bridge = cv_bridge.CvBridge()
+    tac_layout = glovewise.TactileLayout()
+    tac_seq = glovewise.TactileSequence.load(bag_path).process()
+
+    print("solve_path", solve_path)
+    print("solve_data", solve_data)
+
+    tstart = solve_data[0]["time"]
+    tend = solve_data[-1]["time"]
+
+    tac_interp = glovewise.TactileInterpolator(tac_seq, tstart)
+
+    inert_interp = glovewise.InertialInterpolator(tac_seq)
+
+    headers = None
+    data = []
+
+    print("visualize trajectory")
+    for solve_frame in solve_data:
+        current_time = solve_frame["time"]
+        print((current_time - tstart) * 100 / (tend - tstart))
+        profile = 0
+        position_pairs = [
+            it for it in solve_frame["joints"].items() if "/" not in it[0]]
+        tac = tac_interp.interpolate(current_time)
+        tac = tac_layout.serialize_active_cells(tac)
+        if headers is None:
+            headers = ["time"] + ["joint_"+p[0] for p in position_pairs] + \
+                ["tact_"+str(i) for i in range(len(tac))]
+        data.append([current_time] + [p[1]
+                    for p in position_pairs] + [v for v in tac]
+                    )
+
+    print(data)
+    print(headers)
+
+    np.savetxt(glovewise.extpath(bag_path, ".dump.csv"),
+               data, header=" ".join(headers), comments="")

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import cv2
+    import rosbag
+    import sys
+    import cv_bridge
+    import numpy as np
+    import mittenwire
+    import yaml
+
+print(cv2.__version__)
+
+bridge = cv_bridge.CvBridge()
+
+
+board = cv2.aruco.CharucoBoard_create(
+    5, 7, 0.04, 0.02, cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250))
+
+cv2.namedWindow("image", cv2.WINDOW_NORMAL)
+
+visualize = 0
+
+calibration_object = {
+    "name": "charuco_board",
+    "markers": [{
+        "name": "corner"+str(i),
+        "position": {
+            "x": float(board.chessboardCorners[i][0]),
+            "y": float(board.chessboardCorners[i][1]),
+            "z": float(board.chessboardCorners[i][2]),
+        }
+    } for i in range(len(board.chessboardCorners))]
+}
+
+
+def imshow(img):
+    cv2.imshow("image", img)
+    k = cv2.waitKey(0)
+    if k > 0:
+        print(k)
+        if k == 27 or k == 113:
+            exit(0)
+
+
+for bagname in sys.argv[1:]:
+
+    cameras = {}
+    observations = []
+
+    images = []
+
+    prev_time = 0
+
+    def flush():
+        global images
+        if visualize:
+            if len(images):
+                mosaic = mittenwire.make_mosaic(images, (900, 1600),
+                                                (images[0].shape[0], images[0].shape[1]), np.uint8)
+                imshow(mosaic)
+        images = []
+
+    with rosbag.Bag(bagname) as bag:
+
+        for topic, message, time in bag:
+            if topic.startswith("/cam"):
+
+                if time != prev_time:
+                    flush()
+                    prev_time = time
+
+                print(topic, time, type(message))
+
+                img = bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
+                # img = np.square(img)
+
+                img = img.astype(np.float32) * (1.0 / 255)
+                img *= 1.0 / np.percentile(img, 99)
+                img[img > 1.0] = 1.0
+                img = (img * 255).astype(np.uint8)
+
+                print("detect")
+                corners, ids, _ = cv2.aruco.detectMarkers(
+                    img, board.dictionary)
+                print(corners)
+                print(ids)
+                if len(corners) > 2:
+                    if visualize:
+                        cv2.aruco.drawDetectedMarkers(img, corners, ids)
+
+                    print("interpolate")
+                    _, corners, ids = cv2.aruco.interpolateCornersCharuco(
+                        corners, ids, img, board)
+                    print(corners)
+                    print(ids)
+                    if corners is not None and len(corners) > 2:
+                        if visualize:
+                            cv2.aruco.drawDetectedCornersCharuco(
+                                img, corners, ids, (255, 255, 255))
+
+                        # ids = [int(id[0]) for id in ids]
+                        # corners = [[float(f) for f in c[0]] for c in corners]
+                        # corners = [{"x": p[0], "y": p[1]} for p in corners]
+                        # print(ids)
+                        # print(corners)
+
+                        for i in range(len(ids)):
+                            observation = {
+                                "marker": "corner"+str(int(ids[i][0])),
+                                "time": time.to_sec(),
+                                "position": {
+                                    "x": float(corners[i][0][0]),
+                                    "y": float(corners[i][0][1]),
+                                },
+                                "camera": topic
+                            }
+                            print(observation)
+                            observations.append(observation)
+
+                        # frame_detections[topic] = dict(zip(ids, corners))
+
+                        if topic not in cameras:
+                            cameras[topic] = {
+                                "resolution": {
+                                    "width": img.shape[1],
+                                    "height": img.shape[0],
+                                },
+                            }
+
+                # s = 0.5
+                # img = cv2.resize(img, (0, 0), fx=s, fy=s)
+
+                images.append(img)
+
+    flush()
+
+    print(observations)
+
+    with open(bagname + ".calib.yaml", "w") as outfile:
+        yaml.dump({
+            "calibration_data": {
+                "object": calibration_object,
+                "cameras": [{"name": name, **cameras[name]} for name in cameras],
+                "observations": observations,
+            },
+        }, outfile)

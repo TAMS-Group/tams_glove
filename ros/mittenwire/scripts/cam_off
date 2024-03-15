@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+
+import mittenwire
+import time
+
+context = mittenwire.Context()
+dev = mittenwire.Device()
+dev.open_vid_pid(context, 0x0403, 0x601f)
+
+dev.set_gpio_direction(1, 1)
+dev.set_gpio_level(1, 0)

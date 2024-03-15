@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+if 1:
+    import cv2
+    import numpy as np
+    import cv_bridge
+    import rospy
+    import glovewise
+    import rosbag
+    import mittenwire
+    import yaml
+    import threading
+
+
+class BagImage:
+    pass
+
+
+rospy.init_node("glovewise_proc_op")
+
+viz = 1
+
+model = cv2.dnn.readNetFromCaffe(
+    "pose_deploy.prototxt", "pose_iter_102000.caffemodel")
+
+
+def imshow(img):
+    cv2.imshow("images", img)
+    k = cv2.waitKey(0)
+    if k > 0:
+        print(k)
+        if k == 27 or k == 113:
+            exit(0)
+
+
+def process(images):
+    print(images)
+
+    imgs = [bridge.compressed_imgmsg_to_cv2(
+        images[image_index].image, "bgr8") for image_index in range(len(images))]
+
+    for iimg in range(len(imgs)):
+        img = imgs[iimg]
+
+        if 1:
+            s = 0.5
+            img = cv2.resize(img, (0, 0), fx=s, fy=s,
+                             interpolation=cv2.INTER_AREA)
+
+        if 1:
+            hue = -215
+            saturation = 100
+            brightness = 120
+
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2HSV_FULL)
+            h, s, v = cv2.split(img)
+
+            h += np.uint8(int(hue * 256 / 360))
+            s = cv2.multiply(s, (1, 1, 1, 1), scale=saturation * 0.01)
+
+            img = cv2.merge([h, s, v])
+            img = cv2.cvtColor(img, cv2.COLOR_HSV2RGB_FULL)
+
+            img = cv2.multiply(img, (1, 1, 1, 1),
+                               scale=brightness * 0.01)
+
+            img2 = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        flipcodes = [None, -1, 0, 1]
+
+        outs = []
+        for flipcode in flipcodes:
+            flipped = img
+            if flipcode is not None:
+                flipped = cv2.flip(img, flipcode, None)
+            blob_in = cv2.dnn.blobFromImage(flipped, 1.0 / 255, (img.shape[1], img.shape[0]),
+                                            (0, 0, 0), swapRB=False, crop=False)
+            model.setInput(blob_in)
+            with glovewise.Profiler("dnn"):
+                out = model.forward()
+            out2 = []
+            for i in range(out.shape[1]):
+                o = out[0, i, :, :]
+                o = cv2.resize(
+                    o, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_CUBIC)
+                if flipcode is not None:
+                    o = cv2.flip(o, flipcode, None)
+                out2.append(o)
+            outs.append(out2)
+
+        outs = np.mean(outs, axis=0)
+
+        for i in [4]:
+            pmap = outs[i]
+            pmap = cv2.convertScaleAbs(pmap, pmap, alpha=255)
+            pmap = cv2.applyColorMap(pmap, cv2.COLORMAP_JET)
+
+            img2 = cv2.addWeighted(img, 0.2, pmap, 0.8, None)
+
+            with vizlock:
+                vizbag.write(
+                    images[iimg].name+"/"+str(i), bridge.cv2_to_compressed_imgmsg(img2), images[iimg].image.header.stamp)
+
+
+bagpath = sys.argv[1]
+
+if viz:
+    vizbag = rosbag.Bag(glovewise.extpath(bagpath, ".kviz.bag"), "w")
+    vizlock = threading.Lock()
+
+bridge = cv_bridge.CvBridge()
+
+frame_index = 0
+
+with rosbag.Bag(bagpath, "r") as bag:
+
+    last_time = rospy.Time(0)
+
+    image_messages = {}
+    camera_info_messages = {}
+
+    bag_start_time = bag.get_start_time()
+    bag_end_time = bag.get_end_time()
+
+    for topic, message, mtime in bag:
+
+        if rospy.is_shutdown():
+            print("shutting down")
+            break
+
+        print((mtime.to_sec() - bag_start_time) /
+              (bag_end_time - bag_start_time))
+
+        if mtime != last_time:
+            last_time = mtime
+
+            bag_images = []
+            for name in (image_messages.keys() & camera_info_messages.keys()):
+                image_time, image_message = image_messages[name]
+                info_time, info_message = camera_info_messages[name]
+                if image_time == info_time and info_message.roi.width < info_message.width:
+                    b = BagImage()
+                    b.time = last_time
+                    b.name = name
+                    b.image = image_message
+                    b.info = info_message
+                    bag_images.append(b)
+            if len(bag_images) > 0:
+                if frame_index % 10 == 0:
+                    process(bag_images)
+                frame_index += 1
+
+            image_messages = {}
+            camera_info_messages = {}
+
+        if topic.endswith("/image_raw/compressed"):
+            image_messages[topic[:-
+                                 len("/image_raw/compressed")]] = (mtime, message)
+
+        if topic.endswith("/camera_info"):
+            camera_info_messages[topic[:-
+                                       len("/camera_info")]] = (mtime, message)
+
+if viz:
+    print("closing bag")
+    with vizlock:
+        vizbag.close()
+    print("bag closed")

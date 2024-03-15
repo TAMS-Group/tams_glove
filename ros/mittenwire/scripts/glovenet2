@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+
+import mittenwire
+import time
+import numpy as np
+import cv2
+import rospy
+import mittenwire.msg
+
+rospy.init_node("tamsnet_serial", disable_signals=True)
+
+pub_mat = rospy.Publisher("impedance_matrix_raw", mittenwire.msg.ImpedanceMatrix,
+                          latch=False, queue_size=100)
+
+pub_status = rospy.Publisher("glove_status", mittenwire.msg.GloveStatus,
+                             latch=False, queue_size=100)
+
+print("publishers created")
+
+port_count = 8
+
+sensor_configs = {}
+hub_config = False
+
+ctx = mittenwire.Context()
+
+dev = mittenwire.Device()
+dev.open_vid_pid(ctx, 0x0403, 0x601f)
+dev.reset()
+
+print("power on")
+dev.set_gpio_direction(1, 1)
+dev.set_gpio_level(1, 1)
+
+print("start")
+dev.start()
+
+net = mittenwire.Master(dev, 32, 32 * 1024)
+
+hub = mittenwire.Hub(net)
+
+
+nodes = []
+for iport in range(port_count):
+    node = mittenwire.Glove(lambda m: pub_mat.publish(
+        m), lambda m: pub_status.publish(m))
+    nodes.append(node)
+    hub.connect(iport, node)
+
+print("create event loop")
+evl = mittenwire.EventLoop(ctx, [dev])
+
+rospy.spin()
+
+print("exit")

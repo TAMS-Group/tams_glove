@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+
+import glovewise
+import pyassimp
+import tractor
+import rospy
+import sensor_msgs
+import cv_bridge
+import numpy as np
+import cv2
+import time
+import mediapipe
+import tractor as tr
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+
+tr.init_ros("glovewise_hand_detector_tractor")
+
+rospy.init_node("glovewise_hand_detector", anonymous=True)
+
+pub = rospy.Publisher("/camera/handviz", sensor_msgs.msg.Image,
+                      queue_size=1, tcp_nodelay=True)
+
+bridge = cv_bridge.CvBridge()
+hand_detector = mediapipe.solutions.hands.Hands(
+    max_num_hands=1, static_image_mode=True)
+
+mapping = [
+    (0, "hand_ffpalm"),
+
+    (4, "hand_thtip"),
+    (3, "hand_thdistal"),
+    (2, "hand_thmiddle"),
+    (1, "hand_thproximal"),
+
+    (8, "hand_fftip"),
+    (7, "hand_ffdistal"),
+    (6, "hand_ffmiddle"),
+    (5, "hand_ffproximal"),
+
+    (12, "hand_mftip"),
+    (11, "hand_mfdistal"),
+    (10, "hand_mfmiddle"),
+    (9, "hand_mfproximal"),
+
+    (16, "hand_rftip"),
+    (15, "hand_rfdistal"),
+    (14, "hand_rfmiddle"),
+    (13, "hand_rfproximal"),
+
+    (20, "hand_lftip"),
+    (19, "hand_lfdistal"),
+    (18, "hand_lfmiddle"),
+    (17, "hand_lfproximal"),
+
+    (5, "hand_ffproximal"),
+    (9, "hand_mfproximal"),
+    (13, "hand_rfproximal"),
+    (17, "hand_lfproximal"),
+]
+
+glove_model = glovewise.GloveModel()
+glove_model.load_resource("glovewise", "/models/bonehand22.dae")
+end_effectors = [p[1] for p in mapping]
+glove_ik = glovewise.GloveIK(glove_model, end_effectors)
+
+
+def map_landmark_position(landmark):
+    return np.array([landmark.x, landmark.y, landmark.z]) / 3.5
+
+
+def callback(msg):
+    print("image received")
+    img = bridge.imgmsg_to_cv2(msg, "rgb8")
+
+    for i in range(2):
+        img = cv2.medianBlur(img, 5)
+
+    t0 = time.time()
+    results = hand_detector.process(img)
+    print("hand detection runtime", time.time() - t0)
+    print("hand detection results", results)
+
+    if results.multi_hand_landmarks:
+        img = np.array(img, dtype=np.uint8)
+        mediapipe.solutions.drawing_utils.draw_landmarks(
+            img,
+            results.multi_hand_landmarks[0],
+            mediapipe.solutions.hands.HAND_CONNECTIONS,
+            mediapipe.solutions.drawing_styles.get_default_hand_landmarks_style(),
+            mediapipe.solutions.drawing_styles.get_default_hand_connections_style())
+
+    lines = []
+    landmark_map = {}
+    if results.multi_hand_landmarks:
+        print(results.multi_hand_landmarks)
+        landmarks = results.multi_hand_landmarks[0]
+        for index, landmark in enumerate(landmarks.landmark):
+            print(index)
+            landmark_map[index] = map_landmark_position(landmark)
+
+    if 0:
+        for connection in list(mediapipe.solutions.hands.HAND_CONNECTIONS):
+            print(connection)
+            if connection[0] in landmark_map and connection[1] in landmark_map:
+                for index in connection:
+                    print(index)
+                    lines.append(landmark_map[index])
+        tr.visualize_lines("lines", 0.005, (0, 0, 1, 1), lines)
+
+        keypoints = []
+        if results.multi_hand_landmarks:
+            for landmarks in results.multi_hand_landmarks:
+                for landmark in landmarks.landmark:
+                    # print(landmark)
+                    keypoints.append(map_landmark_position(landmark))
+        tr.visualize_points("keypoints", 0.01, (1, 0, 0, 1), keypoints)
+
+    if len(landmark_map) > 0:
+        tstart = time.time()
+        joint_states = glove_ik.solve([
+            landmark_map[p[0]]
+            for p in mapping
+        ])
+        print("ik", time.time() - tstart)
+        link_states = glove_ik.compute_link_states(joint_states)
+        vertices = glove_model.blend_skin_from_link_matrix_function(
+            lambda link_name: glovewise.tractor_pose_to_tuples(link_states.link_pose(link_name)))
+        tr.visualize_mesh("glove", (1, 1, 1, 1), vertices)
+
+    pub.publish(bridge.cv2_to_imgmsg(img))
+
+
+sub = rospy.Subscriber("/camera/image", sensor_msgs.msg.Image,
+                       callback, queue_size=1, tcp_nodelay=True)
+
+rospy.spin()
